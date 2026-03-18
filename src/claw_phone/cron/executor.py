@@ -7,7 +7,6 @@ memory — they are fire-and-forget messages to the owner.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any

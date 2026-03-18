@@ -158,7 +158,7 @@ class TestExecuteCronSuccess:
 
         # DB was updated with the result
         mock_update.assert_awaited_once()
-        args = mock_update.call_args[1] if mock_update.call_args[1] else {}
+        _ = mock_update.call_args[1] if mock_update.call_args[1] else {}
         positional = mock_update.call_args[0]
         # First positional arg is cron_id
         assert positional[0] == "cron-1"

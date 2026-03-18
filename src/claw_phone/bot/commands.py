@@ -453,9 +453,9 @@ async def _forget_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     from claw_phone import context as ctx_module
 
-    new_id = await ctx_module.new_conversation()
+    await ctx_module.new_conversation()
     await update.message.reply_text(
-        f"New conversation started. (Previous history is preserved in DB.)"
+        "New conversation started. (Previous history is preserved in DB.)"
     )
 
 
@@ -581,7 +581,7 @@ async def _logs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         tail = lines[-count:]
         # Filter out noisy getUpdates lines
-        tail = [l for l in tail if "getUpdates" not in l]
+        tail = [line for line in tail if "getUpdates" not in line]
         text = "\n".join(tail) or "(no logs)"
     except OSError as exc:
         await update.message.reply_text(f"Error reading logs: {exc}")

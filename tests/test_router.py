@@ -285,7 +285,7 @@ class TestRunToolLoop:
 
         assert result == "handled error"
         # The tool result message should contain the error
-        tool_result_msg = messages[-1]  # last message before final call
+        _ = messages[-1]  # last message before final call
         # Find the tool result message in the messages list
         tool_results = [m for m in messages if m.get("role") == "tool"]
         assert len(tool_results) == 1

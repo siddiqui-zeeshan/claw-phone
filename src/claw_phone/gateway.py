@@ -162,7 +162,7 @@ async def _async_main() -> None:
         if not log_path.exists():
             return _json.dumps({"error": "Log file not found"})
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        tail = [l for l in lines[-min(count, 200):] if "getUpdates" not in l]
+        tail = [line for line in lines[-min(count, 200):] if "getUpdates" not in line]
         return _json.dumps({"lines": tail, "count": len(tail)})
 
     tool_registry.register(
@@ -183,7 +183,6 @@ async def _async_main() -> None:
 
     async def _send_file(path: str, caption: str = "") -> str:
         import json as _json
-        import os as _os
         from pathlib import Path as _Path
         fpath = _Path(path).resolve()
         if not fpath.exists():

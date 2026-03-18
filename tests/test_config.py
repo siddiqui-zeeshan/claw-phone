@@ -5,7 +5,6 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-import pytest
 import yaml
 
 from claw_phone.config import Config, DEFAULTS, _deep_merge, _resolve_dot, _set_dot

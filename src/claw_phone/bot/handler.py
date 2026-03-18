@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import re
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
