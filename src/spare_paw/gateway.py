@@ -17,13 +17,13 @@ from typing import Any
 
 from telegram.ext import Application
 
-from claw_phone.config import Config, config
-from claw_phone.db import close_db, init_db
+from spare_paw.config import Config, config
+from spare_paw.db import close_db, init_db
 
 logger = logging.getLogger(__name__)
 
-LOG_DIR = Path.home() / ".claw-phone" / "logs"
-HEARTBEAT_PATH = Path.home() / ".claw-phone" / "heartbeat"
+LOG_DIR = Path.home() / ".spare-paw" / "logs"
+HEARTBEAT_PATH = Path.home() / ".spare-paw" / "heartbeat"
 
 
 @dataclass
@@ -62,7 +62,7 @@ def _setup_logging() -> None:
 
     # Rotating file handler
     file_handler = RotatingFileHandler(
-        LOG_DIR / "claw-phone.log",
+        LOG_DIR / "spare-paw.log",
         maxBytes=max_bytes,
         backupCount=backup_count,
         encoding="utf-8",
@@ -104,7 +104,7 @@ async def _async_main() -> None:
 
     # 2. Setup logging (needs config loaded first)
     _setup_logging()
-    logger.info("Starting claw-phone gateway")
+    logger.info("Starting spare-paw gateway")
 
     # 3. Init database
     await init_db()
@@ -117,17 +117,17 @@ async def _async_main() -> None:
     semaphore = asyncio.Semaphore(1)
 
     # 6. Create OpenRouter client
-    from claw_phone.router.openrouter import OpenRouterClient
+    from spare_paw.router.openrouter import OpenRouterClient
 
     api_key = config.get("openrouter.api_key")
     if not api_key:
-        logger.error("No openrouter.api_key in config. Run 'python -m claw_phone setup' first.")
+        logger.error("No openrouter.api_key in config. Run 'python -m spare_paw setup' first.")
         return
 
     router_client = OpenRouterClient(api_key=api_key, semaphore=semaphore)
 
     # 7. Create tool registry and register all tools
-    from claw_phone.tools.registry import ToolRegistry
+    from spare_paw.tools.registry import ToolRegistry
 
     tool_registry = ToolRegistry()
 
@@ -143,8 +143,8 @@ async def _async_main() -> None:
     # 9. Register tools (needs app_state for cron_tools)
     config_data = config.data
 
-    from claw_phone.tools import code, cron_tools, files, memory, shell, subagent, tavily_search, web_scrape
-    from claw_phone.tools.custom_tools import load_custom_tools, register_meta_tools
+    from spare_paw.tools import code, cron_tools, files, memory, shell, subagent, tavily_search, web_scrape
+    from spare_paw.tools.custom_tools import load_custom_tools, register_meta_tools
 
     shell.register(tool_registry, config_data)
     files.register(tool_registry, config_data)
@@ -160,7 +160,7 @@ async def _async_main() -> None:
     # Inline read_logs tool
     async def _read_logs(count: int = 50) -> str:
         import json as _json
-        log_path = LOG_DIR / "claw-phone.log"
+        log_path = LOG_DIR / "spare-paw.log"
         if not log_path.exists():
             return _json.dumps({"error": "Log file not found"})
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -181,7 +181,7 @@ async def _async_main() -> None:
     )
 
     # Inline send_file tool — sends a file via Telegram to the owner
-    _send_file_blocked = {".claw-phone/config.yaml", ".ssh/", ".gnupg/"}
+    _send_file_blocked = {".spare-paw/config.yaml", ".ssh/", ".gnupg/"}
 
     async def _send_file(path: str, caption: str = "") -> str:
         import json as _json
@@ -260,7 +260,7 @@ async def _async_main() -> None:
     mcp_servers = config.get("mcp.servers", [])
     if mcp_servers:
         try:
-            from claw_phone.mcp.client import MCPClientManager
+            from spare_paw.mcp.client import MCPClientManager
 
             mcp_client = MCPClientManager()
             await mcp_client.connect_all(mcp_servers, tool_registry)
@@ -274,7 +274,7 @@ async def _async_main() -> None:
     # 10. Build Telegram application
     bot_token = config.get("telegram.bot_token")
     if not bot_token:
-        logger.error("No telegram.bot_token in config. Run 'python -m claw_phone setup' first.")
+        logger.error("No telegram.bot_token in config. Run 'python -m spare_paw setup' first.")
         return
 
     application = (
@@ -289,7 +289,7 @@ async def _async_main() -> None:
 
     # 12. Register handlers
     try:
-        from claw_phone.bot.handler import setup_handlers, start_queue_processor
+        from spare_paw.bot.handler import setup_handlers, start_queue_processor
 
         setup_handlers(application)
         logger.info("Bot handlers registered")
@@ -299,7 +299,7 @@ async def _async_main() -> None:
 
     # 13. Init cron scheduler
     try:
-        from claw_phone.cron.scheduler import init_scheduler
+        from spare_paw.cron.scheduler import init_scheduler
 
         scheduler = await init_scheduler(app_state)
         app_state.scheduler = scheduler
@@ -378,7 +378,7 @@ async def _async_main() -> None:
     # Close database
     await close_db()
 
-    logger.info("claw-phone gateway stopped")
+    logger.info("spare-paw gateway stopped")
 
 
 def run() -> None:

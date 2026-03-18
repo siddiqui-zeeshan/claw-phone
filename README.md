@@ -1,4 +1,4 @@
-# claw-phone
+# spare-paw
 
 A 24/7 personal AI agent running on a rooted Android phone via Termux, accessible through Telegram. Features multi-model routing via OpenRouter, shell and filesystem tools, scheduled tasks, voice transcription, and full-text search over conversation history. Cold starts in ~1 second.
 
@@ -9,7 +9,7 @@ A 24/7 personal AI agent running on a rooted Android phone via Termux, accessibl
 - **Scheduled tasks (cron)** -- create, edit, pause, resume, and manage recurring AI tasks with per-cron model selection
 - **Photo/image support** -- send photos via Telegram; they are base64-encoded and forwarded to the model as multimodal vision messages. Caption is used as the prompt (defaults to "What do you see in this image?")
 - **Voice messages** -- Groq Whisper transcription for Telegram voice notes
-- **Prompt files** -- loads `IDENTITY.md`, `USER.md`, and `SYSTEM.md` from `~/.claw-phone/` on every turn for personality, user preferences, and device context. Editable live without restart
+- **Prompt files** -- loads `IDENTITY.md`, `USER.md`, and `SYSTEM.md` from `~/.spare-paw/` on every turn for personality, user preferences, and device context. Editable live without restart
 - **Full-text search** -- FTS5-backed search across all conversation history
 - **Sliding window context** -- token-budgeted context assembly with configurable window size and safety margin
 - **Message queue with backpressure** -- incoming messages queue while the bot is busy; typing indicator signals processing
@@ -34,23 +34,23 @@ pkg update && pkg upgrade
 pkg install python python-pip git
 
 git clone <repo-url>
-cd claw-phone
+cd spare-paw
 pip install --break-system-packages -e .
 ```
 
 ### Setup
 
-Run the interactive setup wizard to create `~/.claw-phone/config.yaml`, validate API keys, and initialize the database:
+Run the interactive setup wizard to create `~/.spare-paw/config.yaml`, validate API keys, and initialize the database:
 
 ```bash
-python -m claw_phone setup
+python -m spare_paw setup
 ```
 
 ### Running
 
 ```bash
 # Start the gateway
-python -m claw_phone gateway
+python -m spare_paw gateway
 
 # With watchdog (recommended for always-on operation)
 bash scripts/watchdog.sh
@@ -60,7 +60,7 @@ Use `termux-wake-lock` before starting to prevent Android from killing the proce
 
 ## Configuration
 
-Config file location: `~/.claw-phone/config.yaml`
+Config file location: `~/.spare-paw/config.yaml`
 
 A template is provided at `config.example.yaml`. Key sections:
 
@@ -185,7 +185,7 @@ pytest
 ### Project structure
 
 ```
-src/claw_phone/
+src/spare_paw/
   __main__.py        # Entry point: setup / gateway
   config.py          # Config loading
   db.py              # SQLite connection, schema, migrations

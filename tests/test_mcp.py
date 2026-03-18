@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from claw_phone.mcp.schema import extract_mcp_result, mcp_to_openai_schema
-from claw_phone.tools.registry import ToolRegistry
+from spare_paw.mcp.schema import extract_mcp_result, mcp_to_openai_schema
+from spare_paw.tools.registry import ToolRegistry
 
 
 # ===========================================================================
@@ -114,7 +114,7 @@ class TestMCPClientProxy:
     @pytest.mark.asyncio
     async def test_proxy_registers_tools(self):
         """Verify that connecting a mock MCP server registers namespaced tools."""
-        from claw_phone.mcp.client import MCPClientManager
+        from spare_paw.mcp.client import MCPClientManager
 
         registry = ToolRegistry()
 
@@ -135,8 +135,8 @@ class TestMCPClientProxy:
 
         manager = MCPClientManager()
 
-        with patch("claw_phone.mcp.client.stdio_client") as mock_stdio, \
-             patch("claw_phone.mcp.client.ClientSession") as mock_cs_cls:
+        with patch("spare_paw.mcp.client.stdio_client") as mock_stdio, \
+             patch("spare_paw.mcp.client.ClientSession") as mock_cs_cls:
 
             # stdio_client returns (read, write) streams via async context manager
             mock_transport_ctx = AsyncMock()
@@ -165,7 +165,7 @@ class TestMCPClientProxy:
     @pytest.mark.asyncio
     async def test_proxy_calls_session(self):
         """Verify that invoking a proxied tool calls session.call_tool."""
-        from claw_phone.mcp.client import MCPClientManager
+        from spare_paw.mcp.client import MCPClientManager
 
         mock_session = AsyncMock()
         mock_result = MagicMock()
@@ -184,7 +184,7 @@ class TestMCPClientProxy:
     @pytest.mark.asyncio
     async def test_proxy_handles_error(self):
         """Verify that proxy returns error string on exception."""
-        from claw_phone.mcp.client import MCPClientManager
+        from spare_paw.mcp.client import MCPClientManager
 
         mock_session = AsyncMock()
         mock_session.call_tool = AsyncMock(side_effect=ConnectionError("lost"))
@@ -198,11 +198,11 @@ class TestMCPClientProxy:
     @pytest.mark.asyncio
     async def test_connect_skips_failing_server(self):
         """Verify that a failing server is skipped without crashing."""
-        from claw_phone.mcp.client import MCPClientManager
+        from spare_paw.mcp.client import MCPClientManager
 
         manager = MCPClientManager()
 
-        with patch("claw_phone.mcp.client.stdio_client", side_effect=FileNotFoundError("no such command")):
+        with patch("spare_paw.mcp.client.stdio_client", side_effect=FileNotFoundError("no such command")):
             registry = ToolRegistry()
             await manager.connect_all(
                 [{"name": "bad", "command": "nonexistent"}],

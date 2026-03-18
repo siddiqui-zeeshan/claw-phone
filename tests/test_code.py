@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from claw_phone.tools.registry import ToolRegistry
+from spare_paw.tools.registry import ToolRegistry
 
 
 def _make_app_state() -> MagicMock:
@@ -27,7 +27,7 @@ def _make_app_state() -> MagicMock:
 class TestCodeTool:
     def test_registration(self):
         """Verify the code tool registers correctly."""
-        from claw_phone.tools.code import register
+        from spare_paw.tools.code import register
 
         registry = ToolRegistry()
         app_state = _make_app_state()
@@ -40,10 +40,10 @@ class TestCodeTool:
         assert "task" in func["parameters"]["properties"]
 
     @pytest.mark.asyncio
-    @patch("claw_phone.tools.code.run_tool_loop", new_callable=AsyncMock)
+    @patch("spare_paw.tools.code.run_tool_loop", new_callable=AsyncMock)
     async def test_uses_smart_model(self, mock_loop):
         """Verify the coding tool uses models.smart."""
-        from claw_phone.tools.code import _handle_code
+        from spare_paw.tools.code import _handle_code
 
         mock_loop.return_value = "Fixed the bug"
         app_state = _make_app_state()
@@ -55,10 +55,10 @@ class TestCodeTool:
         mock_loop.assert_awaited_once()
 
     @pytest.mark.asyncio
-    @patch("claw_phone.tools.code.run_tool_loop", new_callable=AsyncMock)
+    @patch("spare_paw.tools.code.run_tool_loop", new_callable=AsyncMock)
     async def test_falls_back_to_default_model(self, mock_loop):
         """Verify fallback to default model when smart is not set."""
-        from claw_phone.tools.code import _handle_code
+        from spare_paw.tools.code import _handle_code
 
         mock_loop.return_value = "Done"
         app_state = _make_app_state()
@@ -73,10 +73,10 @@ class TestCodeTool:
         assert result["model"] == "google/gemini-2.0-flash"
 
     @pytest.mark.asyncio
-    @patch("claw_phone.tools.code.run_tool_loop", new_callable=AsyncMock)
+    @patch("spare_paw.tools.code.run_tool_loop", new_callable=AsyncMock)
     async def test_handles_error(self, mock_loop):
         """Verify error handling when the tool loop fails."""
-        from claw_phone.tools.code import _handle_code
+        from spare_paw.tools.code import _handle_code
 
         mock_loop.side_effect = RuntimeError("model down")
         app_state = _make_app_state()
@@ -87,10 +87,10 @@ class TestCodeTool:
         assert "RuntimeError" in result["error"]
 
     @pytest.mark.asyncio
-    @patch("claw_phone.tools.code.run_tool_loop", new_callable=AsyncMock)
+    @patch("spare_paw.tools.code.run_tool_loop", new_callable=AsyncMock)
     async def test_filters_tools(self, mock_loop):
         """Verify only shell, files, and MCP tools are passed to the sub-agent."""
-        from claw_phone.tools.code import _handle_code
+        from spare_paw.tools.code import _handle_code
 
         mock_loop.return_value = "Done"
         app_state = _make_app_state()

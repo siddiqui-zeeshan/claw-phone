@@ -10,7 +10,7 @@ import json
 import logging
 from typing import Any
 
-from claw_phone.router.tool_loop import run_tool_loop
+from spare_paw.router.tool_loop import run_tool_loop
 
 logger = logging.getLogger(__name__)
 

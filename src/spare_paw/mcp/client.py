@@ -14,7 +14,7 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from claw_phone.mcp.schema import extract_mcp_result
+from spare_paw.mcp.schema import extract_mcp_result
 
 logger = logging.getLogger(__name__)
 
