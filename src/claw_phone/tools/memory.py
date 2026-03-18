@@ -168,9 +168,10 @@ def register(registry: ToolRegistry, config: dict[str, Any]) -> None:
     registry.register(
         name="remember",
         description=(
-            "Save a fact or piece of information to persistent memory. "
-            "Use this when the user shares personal facts, preferences, or "
-            "important information worth keeping across conversations."
+            "Save important information to persistent memory that survives /forget. "
+            "Use for: names, preferences, passwords, birthdays, addresses, account details, "
+            "recurring preferences. Do NOT save: transient conversation details, things easily "
+            "searchable, or one-time instructions."
         ),
         parameters_schema=REMEMBER_SCHEMA,
         handler=_handle_remember,
@@ -180,8 +181,9 @@ def register(registry: ToolRegistry, config: dict[str, Any]) -> None:
     registry.register(
         name="recall",
         description=(
-            "Search persistent memory for previously saved information. "
-            "Use this when you need to look up something the user told you before."
+            "Search persistent memory. All memories are already in your system prompt — "
+            "only use this tool if you need to search for something specific that might "
+            "not be in the current prompt window."
         ),
         parameters_schema=RECALL_SCHEMA,
         handler=_handle_recall,

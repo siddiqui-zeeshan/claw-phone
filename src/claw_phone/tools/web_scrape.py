@@ -45,8 +45,9 @@ PARAMETERS_SCHEMA: dict[str, Any] = {
 }
 
 DESCRIPTION = (
-    "Fetch a web page and extract its text content. "
-    "Optionally use a CSS selector to target specific elements."
+    "Fetch and extract text from a specific URL. "
+    "Use this when you already have a URL and need its content. "
+    "Use web_search first if you need to find URLs."
 )
 
 # Tags whose content is noise — strip them before extracting text.

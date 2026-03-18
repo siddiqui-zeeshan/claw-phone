@@ -213,6 +213,8 @@ Install the resulting plugin ZIP from `build/distributions/` into DataGrip.
 - **Shell commands logged verbatim** — Commands containing secrets (API keys, tokens) appear in log files.
 - **owner_id type mismatch risk** — If config has owner_id as a string, auth comparison silently fails. Should cast to int.
 - **No dependency lockfile** — Builds use latest compatible versions, not pinned.
+- **No prompt injection protection on web_scrape** — Scraped content enters the model context without sanitization. Malicious pages could inject instructions.
+- **Key security rules not repeated at end of system prompt** — Model attention is strongest at start/end of prompt; security constraints should be reinforced at both.
 
 ## License
 

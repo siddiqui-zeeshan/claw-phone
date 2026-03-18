@@ -242,9 +242,10 @@ def register(registry: Any, config: dict[str, Any], app_state: Any) -> None:
     registry.register(
         name="spawn_agent",
         description=(
-            "Spawn a background agent to handle a task independently. "
-            "The agent runs its own tool loop and sends results via Telegram "
-            "when done. Use for research, long-running tasks, or parallel work."
+            "Spawn a background agent for tasks requiring extensive research (3+ web searches), "
+            "comparisons, or long analysis. The agent works independently and sends results via "
+            "Telegram when done. Do NOT spawn for simple questions, quick lookups, or single "
+            "tool calls — handle those directly."
         ),
         parameters_schema=SPAWN_SCHEMA,
         handler=_spawn_handler,

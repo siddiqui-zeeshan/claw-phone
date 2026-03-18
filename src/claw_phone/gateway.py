@@ -240,8 +240,9 @@ async def _async_main() -> None:
     tool_registry.register(
         name="send_message",
         description=(
-            "Send a text message to the user proactively via Telegram. "
-            "Use this when you need to notify the user outside of a direct reply."
+            "Send a message to the user via Telegram. Use this inside cron jobs and "
+            "background agents to deliver results. In normal conversation, prefer "
+            "replying directly instead of calling this tool."
         ),
         parameters_schema={
             "type": "object",

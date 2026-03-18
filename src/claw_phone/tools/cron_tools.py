@@ -110,6 +110,15 @@ async def _handle_cron_create(
     once: bool = False,
 ) -> str:
     """Create a new cron job, persist to DB, and schedule via CronScheduler."""
+    # Resolve model slot names to actual model IDs
+    if model:
+        slot_names = {"default", "smart", "cron_default"}
+        if model in slot_names:
+            model = app_state.config.get(f"models.{model}") or None
+        elif "/" not in model:
+            # Doesn't look like a valid model ID — treat as null
+            model = None
+
     cron_id = str(uuid.uuid4())[:8]
     now = datetime.now(timezone.utc).isoformat()
     tools_json = json.dumps(tools_allowed) if tools_allowed else None
@@ -317,9 +326,11 @@ def register(
     registry.register(
         name="cron_create",
         description=(
-            "Create a new scheduled task (cron job). "
-            "Specify a cron expression for the schedule and a prompt to run. "
-            "Set once=true for one-shot reminders that auto-delete after firing."
+            "Create a scheduled task. Schedule uses cron expressions: "
+            "'*/5 * * * *' (every 5 min), '0 10 * * *' (daily 10am), '0 */2 * * *' (every 2 hours). "
+            "The prompt runs WITHOUT conversation context — make it self-contained with clear instructions. "
+            "Set once=true for one-shot tasks that auto-delete after firing. "
+            "Crons cannot create other crons or spawn agents."
         ),
         parameters_schema=CRON_CREATE_SCHEMA,
         handler=_create_handler,

@@ -35,8 +35,9 @@ PARAMETERS_SCHEMA: dict[str, Any] = {
 }
 
 DESCRIPTION = (
-    "Search the web using Tavily Search. "
-    "Returns a list of results with title, URL, and description."
+    "Search the web. Returns titles, URLs, and descriptions. "
+    "Use this to find information or discover URLs. "
+    "To read the content of a specific URL, use web_scrape instead."
 )
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"

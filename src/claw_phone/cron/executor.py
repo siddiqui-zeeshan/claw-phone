@@ -80,6 +80,10 @@ async def execute_cron(
             else:
                 tools = all_schemas
 
+        # Crons cannot create other crons or spawn agents
+        _blocked = {"cron_create", "cron_edit", "cron_delete", "spawn_agent", "list_agents"}
+        tools = [s for s in tools if s.get("function", {}).get("name") not in _blocked]
+
         # 4. Get the OpenRouter client
         router_client = getattr(app_state, "router_client", None)
         if router_client is None:
@@ -101,14 +105,11 @@ async def execute_cron(
         owner_id = app_state.config.get("telegram.owner_id")
         if owner_id and app_state.application:
             bot = app_state.application.bot
-            await _send_chunked(bot, owner_id, f"[cron:{cron_id}]\n{result}")
+            await _send_chunked(bot, owner_id, result)
 
         # 7. Update DB — success
         await _update_cron_result(cron_id, now, result=result)
         logger.info("Cron %s executed successfully", cron_id)
-
-        # 8. Auto-delete one-shot crons
-        await _maybe_delete_once(app_state, cron_id)
 
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
@@ -129,6 +130,10 @@ async def execute_cron(
 
         # Update DB — error
         await _update_cron_result(cron_id, now, error=error_msg)
+
+    finally:
+        # Auto-delete one-shot crons regardless of success/failure
+        await _maybe_delete_once(app_state, cron_id)
 
 
 async def _send_chunked(bot: Any, chat_id: int, text: str) -> None:

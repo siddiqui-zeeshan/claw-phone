@@ -36,8 +36,10 @@ PARAMETERS_SCHEMA: dict[str, Any] = {
 }
 
 DESCRIPTION = (
-    "Execute a shell command on the device. "
-    "Returns stdout, stderr, and exit code."
+    "Execute a shell command on the Android phone (Termux). "
+    "Use termux-api commands for device interactions: termux-battery-status, "
+    "termux-location, termux-camera-photo, termux-notification, termux-tts-speak, "
+    "termux-sensor, etc. Use 'su -c' for root commands."
 )
 
 # -- Handler ---------------------------------------------------------------
