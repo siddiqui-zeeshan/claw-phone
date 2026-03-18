@@ -8,6 +8,7 @@ Commands:
     /forget                             — start a new conversation
     /model <name>                       — shortcut for /config model
     /approve <name>                     — approve a pending custom tool
+    /mcp                                — list connected MCP servers
 """
 
 from __future__ import annotations
@@ -620,6 +621,37 @@ async def _agents_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ---------------------------------------------------------------------------
+# /mcp — list connected MCP servers and tools
+# ---------------------------------------------------------------------------
+
+async def _mcp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show connected MCP servers and their tools."""
+    app_state = _get_app_state(context)
+    if not _is_owner(update, app_state):
+        return
+
+    mcp_client = getattr(app_state, "mcp_client", None)
+    if mcp_client is None:
+        await update.message.reply_text("No MCP servers connected.")
+        return
+
+    status = mcp_client.get_status()
+    if not status["servers"]:
+        await update.message.reply_text("No MCP servers connected.")
+        return
+
+    lines: list[str] = []
+    for srv in status["servers"]:
+        state = "connected" if srv["connected"] else "DISCONNECTED"
+        lines.append(f"  {srv['name']} [{state}] — {srv['tools']} tools")
+        for tool_name in srv["tool_names"]:
+            lines.append(f"    - {tool_name}")
+
+    text = f"MCP servers ({len(status['servers'])}):\n\n" + "\n".join(lines)
+    await update.message.reply_text(text)
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -635,3 +667,4 @@ def register_commands(application: "Application") -> None:
     application.add_handler(CommandHandler("approve", _approve_handler))
     application.add_handler(CommandHandler("agents", _agents_handler))
     application.add_handler(CommandHandler("logs", _logs_handler))
+    application.add_handler(CommandHandler("mcp", _mcp_handler))

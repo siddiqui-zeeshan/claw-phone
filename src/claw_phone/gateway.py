@@ -37,6 +37,7 @@ class AppState:
     router_client: Any = None
     application: Application | None = None
     scheduler: Any = None
+    mcp_client: Any = None
     start_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -254,6 +255,19 @@ async def _async_main() -> None:
         run_in_executor=False,
     )
 
+    # 9b. Connect to MCP servers (if configured)
+    mcp_servers = config.get("mcp.servers", [])
+    if mcp_servers:
+        try:
+            from claw_phone.mcp.client import MCPClientManager
+
+            mcp_client = MCPClientManager()
+            await mcp_client.connect_all(mcp_servers, tool_registry)
+            app_state.mcp_client = mcp_client
+            logger.info("MCP client connected to %d servers", len(mcp_client.get_status()["servers"]))
+        except Exception:
+            logger.exception("Failed to initialize MCP client — continuing without MCP")
+
     logger.info("Tool registry initialized with %d tools", len(tool_registry))
 
     # 10. Build Telegram application
@@ -337,6 +351,13 @@ async def _async_main() -> None:
             await app_state.scheduler.stop()
         except Exception:
             logger.exception("Error shutting down scheduler")
+
+    # Close MCP client
+    if app_state.mcp_client is not None:
+        try:
+            await app_state.mcp_client.close()
+        except Exception:
+            logger.exception("Error closing MCP client")
 
     # Close OpenRouter client
     try:

@@ -14,6 +14,8 @@ A 24/7 personal AI agent running on a rooted Android phone via Termux, accessibl
 - **Sliding window context** -- token-budgeted context assembly with configurable window size and safety margin
 - **Message queue with backpressure** -- incoming messages queue while the bot is busy; typing indicator signals processing
 - **Heartbeat watchdog** -- detects event loop starvation and deadlocks, not just process crashes
+- **MCP client** -- connect to external MCP servers (GitHub, filesystem, etc.) and use their tools alongside native tools
+- **MCP server** -- expose native phone tools as an MCP server via stdio transport, so Claude Code and other MCP clients can use them remotely
 - **Owner-only auth** -- all messages from non-owner Telegram users are silently ignored
 
 ## Prerequisites
@@ -22,6 +24,7 @@ A 24/7 personal AI agent running on a rooted Android phone via Termux, accessibl
 - Termux (on Android)
 - Rooted Android recommended (8GB+ RAM, 128GB+ storage, always-on Wi-Fi)
 - API keys: OpenRouter (required), Telegram Bot Token (required), Tavily (optional, for web search), Groq (optional, for voice)
+- Node.js (optional, for MCP servers that use `npx`)
 
 ## Quick Start
 
@@ -71,6 +74,7 @@ A template is provided at `config.example.yaml`. Key sections:
 | `tavily` | Tavily API key for web search |
 | `context` | `max_messages`, `token_budget`, `safety_margin` |
 | `tools` | Per-tool enable/disable, timeouts, allowed paths |
+| `mcp` | MCP client servers and MCP server settings |
 | `agent` | `max_tool_iterations`, `system_prompt` template |
 | `logging` | Log level, rotation size, backup count |
 
@@ -99,6 +103,7 @@ models:
 | `/search <query>` | Full-text search over conversation history |
 | `/forget` | Start a new conversation (history preserved in DB) |
 | `/model <name>` | Shortcut for `/config model <name>` |
+| `/mcp` | List connected MCP servers and their tools |
 
 ## Tools
 
@@ -115,6 +120,46 @@ All tools are exposed to the LLM as callable functions. Blocking tools run in a 
 | `cron_delete` | Delete a scheduled task | By cron ID |
 | `cron_list` | List all scheduled tasks | Returns schedule, status, last run info |
 
+## MCP (Model Context Protocol)
+
+claw-phone supports MCP in both directions -- as a client that connects to external MCP servers, and as a server that exposes its own tools.
+
+### MCP Client
+
+Connect to any MCP server to pull in additional tools. These tools become available to the LLM alongside the native tools. Configure servers in `config.yaml`:
+
+```yaml
+mcp:
+  servers:
+    - name: "github"
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-github"]
+      env:
+        GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
+```
+
+Each server is launched as a subprocess using stdio transport. The `/mcp` Telegram command shows connected servers and their available tools.
+
+### MCP Server
+
+Expose claw-phone's native tools (shell, files, web search, cron, etc.) as an MCP server so that Claude Code and other MCP clients can use them remotely:
+
+```bash
+python -m claw_phone mcp-server
+```
+
+This starts a stdio-transport MCP server. To use it from Claude Code, add it to your MCP client config pointing at the command above.
+
+```yaml
+mcp:
+  server:
+    enabled: true
+```
+
+### Dependency
+
+MCP support requires `mcp>=1.26.0`, included in the package dependencies.
+
 ## Architecture
 
 ```
@@ -128,8 +173,12 @@ Model Router (OpenRouter API, semaphore-serialized, retry with backoff)
   |
   v
 Tools (ProcessPoolExecutor: shell, files, web search, web scrape, cron, vision)
+  |                         \
+  |                          MCP Client (connects to external MCP servers)
   |
 Cron Scheduler (APScheduler, SQLite-persisted, semaphore-gated)
+
+MCP Server (stdio transport, exposes native tools to external clients)
 ```
 
 Key design points:
@@ -183,6 +232,10 @@ src/claw_phone/
   cron/
     scheduler.py     # APScheduler setup
     executor.py      # Cron job execution
+  mcp/
+    client.py        # MCP client: connects to external MCP servers
+    server.py        # MCP server: exposes native tools via stdio
+    schema.py        # MCP schema conversion utilities
 ```
 
 ## DataGrip Database MCP Tools

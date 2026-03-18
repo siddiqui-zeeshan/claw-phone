@@ -60,6 +60,12 @@ DEFAULTS: dict[str, Any] = {
         "max_bytes": 10485760,
         "backup_count": 3,
     },
+    "mcp": {
+        "servers": [],
+        "server": {
+            "enabled": True,
+        },
+    },
 }
 
 
