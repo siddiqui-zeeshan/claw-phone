@@ -207,6 +207,13 @@ cd datagrip-database-mcp
 
 Install the resulting plugin ZIP from `build/distributions/` into DataGrip.
 
+## Known Issues
+
+- **MarkdownV2 rendering falls back to plain text** — Model outputs standard Markdown but Telegram's MarkdownV2 is strict about escaping. Currently falls back to plain text. Fix: convert to Telegram HTML format instead.
+- **Shell commands logged verbatim** — Commands containing secrets (API keys, tokens) appear in log files.
+- **owner_id type mismatch risk** — If config has owner_id as a string, auth comparison silently fails. Should cast to int.
+- **No dependency lockfile** — Builds use latest compatible versions, not pinned.
+
 ## License
 
 TBD
