@@ -183,6 +183,78 @@ async def test_fts_update_trigger():
 # close_db
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Schema v2 — memories table and FTS
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_schema_v2_creates_memories_table():
+    """init_db should create the memories table as part of v2 migration."""
+    await db_mod.init_db()
+    conn = await db_mod.get_db()
+
+    async with conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    ) as cur:
+        tables = {row[0] for row in await cur.fetchall()}
+
+    assert "memories" in tables
+    assert "memories_fts" in tables
+
+
+@pytest.mark.asyncio
+async def test_memories_fts_triggers():
+    """Insert/update/delete on memories should sync the FTS index via triggers."""
+    await db_mod.init_db()
+    conn = await db_mod.get_db()
+
+    now = "2026-01-01T00:00:00+00:00"
+
+    # INSERT — should appear in FTS
+    await conn.execute(
+        "INSERT INTO memories (id, key, value, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("m1", "wifi", "hunter2", now, now),
+    )
+    await conn.commit()
+
+    async with conn.execute(
+        "SELECT key, value FROM memories_fts WHERE memories_fts MATCH 'wifi'"
+    ) as cur:
+        rows = await cur.fetchall()
+    assert len(rows) == 1
+
+    # UPDATE — old term gone, new term present
+    await conn.execute(
+        "UPDATE memories SET key = ?, value = ?, updated_at = ? WHERE id = ?",
+        ("network", "newpass", now, "m1"),
+    )
+    await conn.commit()
+
+    async with conn.execute(
+        "SELECT key FROM memories_fts WHERE memories_fts MATCH 'wifi'"
+    ) as cur:
+        assert len(await cur.fetchall()) == 0
+
+    async with conn.execute(
+        "SELECT key FROM memories_fts WHERE memories_fts MATCH 'network'"
+    ) as cur:
+        assert len(await cur.fetchall()) == 1
+
+    # DELETE — removed from FTS
+    await conn.execute("DELETE FROM memories WHERE id = ?", ("m1",))
+    await conn.commit()
+
+    async with conn.execute(
+        "SELECT key FROM memories_fts WHERE memories_fts MATCH 'network'"
+    ) as cur:
+        assert len(await cur.fetchall()) == 0
+
+
+# ---------------------------------------------------------------------------
+# close_db
+# ---------------------------------------------------------------------------
+
 @pytest.mark.asyncio
 async def test_close_db():
     await db_mod.init_db()

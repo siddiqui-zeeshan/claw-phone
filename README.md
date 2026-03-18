@@ -185,6 +185,28 @@ src/claw_phone/
     executor.py      # Cron job execution
 ```
 
+## DataGrip Database MCP Tools
+
+The `datagrip-database-mcp/` subdirectory contains a JetBrains plugin that extends DataGrip's built-in MCP server with six database tools, letting Claude Code query databases through DataGrip's existing connections (SSH tunnels, SSL, auth) with zero config.
+
+| Tool | Description |
+|------|-------------|
+| `list_datasources` | List all configured data sources |
+| `get_schema` | Get schema metadata for a data source |
+| `run_query` | Execute a SQL query and return results |
+| `explain_query` | Run EXPLAIN on a query and return the plan |
+| `get_table_info` | Get detailed info for a specific table |
+| `search_schema` | Search across schema objects by name |
+
+### Build
+
+```bash
+cd datagrip-database-mcp
+./gradlew build
+```
+
+Install the resulting plugin ZIP from `build/distributions/` into DataGrip.
+
 ## License
 
 TBD

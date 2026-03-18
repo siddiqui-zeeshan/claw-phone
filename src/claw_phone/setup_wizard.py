@@ -26,8 +26,8 @@ models:
   smart: "anthropic/claude-sonnet-4"
   cron_default: "google/gemini-2.0-flash"
 
-brave:
-  api_key: "{brave_key}"
+tavily:
+  api_key: "{tavily_key}"
 
 groq:
   api_key: "{groq_key}"
@@ -47,7 +47,7 @@ tools:
     allowed_paths:
       - "/sdcard"
       - "/data/data/com.termux/files/home"
-  brave_search:
+  web_search:
     enabled: true
     max_results: 5
   web_scrape:
@@ -72,6 +72,21 @@ logging:
   max_bytes: 10485760
   backup_count: 3
 """
+
+
+def _copy_defaults() -> None:
+    """Copy default prompt files (IDENTITY.md, USER.md, SYSTEM.md) if they don't exist."""
+    import importlib.resources
+
+    defaults_dir = Path(__file__).resolve().parent.parent.parent / "defaults"
+    for filename in ("IDENTITY.md", "USER.md", "SYSTEM.md"):
+        target = CLAW_DIR / filename
+        if target.exists():
+            continue
+        source = defaults_dir / filename
+        if source.exists():
+            target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            print(f"  Created {target}")
 
 
 def _prompt_required(label: str) -> str:
@@ -112,7 +127,13 @@ def run() -> None:
     # 1. Create directories
     CLAW_DIR.mkdir(parents=True, exist_ok=True)
     (CLAW_DIR / "logs").mkdir(parents=True, exist_ok=True)
+    (CLAW_DIR / "skills").mkdir(parents=True, exist_ok=True)
+    (CLAW_DIR / "custom_tools").mkdir(parents=True, exist_ok=True)
+    (CLAW_DIR / "custom_tools" / ".pending").mkdir(parents=True, exist_ok=True)
     print(f"Created {CLAW_DIR}/")
+
+    # Copy default prompt files if they don't exist
+    _copy_defaults()
     print()
 
     # 2. Check for existing config
@@ -136,7 +157,7 @@ def run() -> None:
     print()
     print("--- Optional ---")
     print()
-    brave_key = _prompt_optional("Brave Search API key")
+    tavily_key = _prompt_optional("Tavily Search API key")
     groq_key = _prompt_optional("Groq API key (for voice messages)")
 
     # 4. Write config
@@ -144,7 +165,7 @@ def run() -> None:
         bot_token=bot_token,
         owner_id=owner_id,
         openrouter_key=openrouter_key,
-        brave_key=brave_key,
+        tavily_key=tavily_key,
         groq_key=groq_key,
     )
     CONFIG_PATH.write_text(config_content, encoding="utf-8")

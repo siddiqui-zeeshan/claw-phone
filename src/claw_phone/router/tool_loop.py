@@ -108,6 +108,15 @@ async def run_tool_loop(
                 }
             )
 
+            # Check for stop signal (e.g. spawn_agent wants to end the turn)
+            try:
+                parsed = json.loads(result_str)
+                if isinstance(parsed, dict) and parsed.get("__stop_turn__"):
+                    logger.info("Tool %s requested turn stop", name)
+                    return parsed.get("reply", result_str)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
     # Exhausted max_iterations — make one final call without tools to get a
     # text summary from the model, or return a fallback error.
     logger.warning(

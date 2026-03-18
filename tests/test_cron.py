@@ -202,7 +202,7 @@ class TestExecuteCronError:
     @pytest.mark.asyncio
     @patch("claw_phone.cron.executor._update_cron_result", new_callable=AsyncMock)
     @patch("claw_phone.cron.executor.run_tool_loop", new_callable=AsyncMock)
-    async def test_error_notification_failure_does_not_propagate(self, mock_tool_loop, mock_update):
+    async def test_error_notification_failure_does_not_propagate(self, mock_tool_loop, mock_update):  # noqa: E501
         """If sending the error notification itself fails, execute_cron still doesn't raise."""
         from claw_phone.cron.executor import execute_cron
 
@@ -218,3 +218,66 @@ class TestExecuteCronError:
 
         # DB update should still have been attempted
         mock_update.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# One-shot auto-delete
+# ---------------------------------------------------------------------------
+
+
+class TestOneShotCronAutoDelete:
+    """Test _maybe_delete_once auto-deletes crons with metadata.once=true."""
+
+    @pytest.mark.asyncio
+    async def test_one_shot_cron_auto_deletes(self):
+        """A cron with metadata={"once": true} should be deleted after execution."""
+        from claw_phone.cron.executor import _maybe_delete_once
+
+        # Build a mock DB that returns a row with once=true metadata
+        mock_row = {"metadata": '{"once": true}'}
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchone = AsyncMock(return_value=mock_row)
+
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(return_value=mock_cursor)
+        mock_db.commit = AsyncMock()
+
+        app_state = _make_app_state()
+        app_state.scheduler = AsyncMock()
+        app_state.scheduler.remove_job = AsyncMock()
+
+        with patch("claw_phone.cron.executor.get_db", return_value=mock_db):
+            await _maybe_delete_once(app_state, "cron-once-1")
+
+        # Verify DELETE was issued
+        delete_calls = [
+            call for call in mock_db.execute.call_args_list
+            if "DELETE" in str(call)
+        ]
+        assert len(delete_calls) == 1
+        assert "cron-once-1" in str(delete_calls[0])
+
+        # Verify scheduler was notified
+        app_state.scheduler.remove_job.assert_awaited_once_with("cron-once-1")
+
+    @pytest.mark.asyncio
+    async def test_non_once_cron_is_not_deleted(self):
+        """A cron without once=true in metadata should NOT be deleted."""
+        from claw_phone.cron.executor import _maybe_delete_once
+
+        mock_row = {"metadata": '{"repeat": true}'}
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchone = AsyncMock(return_value=mock_row)
+
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(return_value=mock_cursor)
+
+        app_state = _make_app_state()
+        app_state.scheduler = AsyncMock()
+
+        with patch("claw_phone.cron.executor.get_db", return_value=mock_db):
+            await _maybe_delete_once(app_state, "cron-repeat")
+
+        # Only the SELECT should have been called, no DELETE
+        calls_str = str(mock_db.execute.call_args_list)
+        assert "DELETE" not in calls_str

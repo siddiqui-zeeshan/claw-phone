@@ -594,6 +594,32 @@ async def _logs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ---------------------------------------------------------------------------
+# /agents — list background agents
+# ---------------------------------------------------------------------------
+
+async def _agents_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all background agents and their status."""
+    app_state = _get_app_state(context)
+    if not _is_owner(update, app_state):
+        return
+
+    from claw_phone.tools.subagent import _agents
+
+    if not _agents:
+        await update.message.reply_text("No agents have been spawned.")
+        return
+
+    lines: list[str] = []
+    for aid, info in sorted(_agents.items(), key=lambda x: x[1].get("created_at", ""), reverse=True):
+        status = info.get("status", "?")
+        name = info.get("name", "?")
+        lines.append(f"  {aid[:8]}  {name}  [{status}]")
+
+    text = f"Agents ({len(_agents)}):\n\n" + "\n".join(lines[:20])
+    await update.message.reply_text(text)
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -607,4 +633,5 @@ def register_commands(application: "Application") -> None:
     application.add_handler(CommandHandler("model", _model_handler))
     application.add_handler(CommandHandler("tools", _tools_handler))
     application.add_handler(CommandHandler("approve", _approve_handler))
+    application.add_handler(CommandHandler("agents", _agents_handler))
     application.add_handler(CommandHandler("logs", _logs_handler))
