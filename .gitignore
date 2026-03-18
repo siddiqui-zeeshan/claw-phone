@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+*.pyc
+.env
+config.yaml
+*.db
+.claw-phone/
+dist/
+build/
+.pytest_cache/

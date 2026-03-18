@@ -1,0 +1,190 @@
+# claw-phone
+
+A 24/7 personal AI agent running on a rooted Android phone via Termux, accessible through Telegram. Features multi-model routing via OpenRouter, shell and filesystem tools, scheduled tasks, voice transcription, and full-text search over conversation history. Cold starts in ~1 second.
+
+## Features
+
+- **Multi-model routing** -- configure model slots (default, smart, cron) via OpenRouter; switch on the fly
+- **Tool use** -- shell commands, file operations, web search, web scraping, cron management; all exposed as LLM function calls
+- **Scheduled tasks (cron)** -- create, edit, pause, resume, and manage recurring AI tasks with per-cron model selection
+- **Photo/image support** -- send photos via Telegram; they are base64-encoded and forwarded to the model as multimodal vision messages. Caption is used as the prompt (defaults to "What do you see in this image?")
+- **Voice messages** -- Groq Whisper transcription for Telegram voice notes
+- **Prompt files** -- loads `IDENTITY.md`, `USER.md`, and `SYSTEM.md` from `~/.claw-phone/` on every turn for personality, user preferences, and device context. Editable live without restart
+- **Full-text search** -- FTS5-backed search across all conversation history
+- **Sliding window context** -- token-budgeted context assembly with configurable window size and safety margin
+- **Message queue with backpressure** -- incoming messages queue while the bot is busy; typing indicator signals processing
+- **Heartbeat watchdog** -- detects event loop starvation and deadlocks, not just process crashes
+- **Owner-only auth** -- all messages from non-owner Telegram users are silently ignored
+
+## Prerequisites
+
+- Python 3.11+
+- Termux (on Android)
+- Rooted Android recommended (8GB+ RAM, 128GB+ storage, always-on Wi-Fi)
+- API keys: OpenRouter (required), Telegram Bot Token (required), Tavily (optional, for web search), Groq (optional, for voice)
+
+## Quick Start
+
+### Termux installation
+
+```bash
+pkg update && pkg upgrade
+pkg install python python-pip git
+
+git clone <repo-url>
+cd claw-phone
+pip install --break-system-packages -e .
+```
+
+### Setup
+
+Run the interactive setup wizard to create `~/.claw-phone/config.yaml`, validate API keys, and initialize the database:
+
+```bash
+python -m claw_phone setup
+```
+
+### Running
+
+```bash
+# Start the gateway
+python -m claw_phone gateway
+
+# With watchdog (recommended for always-on operation)
+bash scripts/watchdog.sh
+```
+
+Use `termux-wake-lock` before starting to prevent Android from killing the process.
+
+## Configuration
+
+Config file location: `~/.claw-phone/config.yaml`
+
+A template is provided at `config.example.yaml`. Key sections:
+
+| Section | Purpose |
+|---------|---------|
+| `telegram` | Bot token and owner ID |
+| `openrouter` | OpenRouter API key |
+| `models` | Model slots: `default`, `smart`, `cron_default` |
+| `groq` | Groq API key for voice transcription |
+| `tavily` | Tavily API key for web search |
+| `context` | `max_messages`, `token_budget`, `safety_margin` |
+| `tools` | Per-tool enable/disable, timeouts, allowed paths |
+| `agent` | `max_tool_iterations`, `system_prompt` template |
+| `logging` | Log level, rotation size, backup count |
+
+Model slot examples:
+
+```yaml
+models:
+  default: "google/gemini-2.0-flash"
+  smart: "anthropic/claude-sonnet-4"
+  cron_default: "google/gemini-2.0-flash"
+```
+
+## Telegram Commands
+
+| Command | Description |
+|---------|-------------|
+| `/cron list` | List all crons with ID, schedule, next run, model, status |
+| `/cron remove <id>` | Delete a cron |
+| `/cron pause <id>` | Pause a cron without deleting |
+| `/cron resume <id>` | Resume a paused cron |
+| `/cron info <id>` | Show details, last result, recent failures |
+| `/config show` | Show current runtime config |
+| `/config model <name>` | Override default model for this session |
+| `/config reset` | Reset overrides to config.yaml defaults |
+| `/status` | Uptime, memory, DB size, active crons, last error |
+| `/search <query>` | Full-text search over conversation history |
+| `/forget` | Start a new conversation (history preserved in DB) |
+| `/model <name>` | Shortcut for `/config model <name>` |
+
+## Tools
+
+All tools are exposed to the LLM as callable functions. Blocking tools run in a `ProcessPoolExecutor` to keep the async event loop responsive.
+
+| Tool | Description | Notes |
+|------|-------------|-------|
+| `shell` | Execute shell commands in Termux | Configurable timeout (default 30s), output truncated at 10K chars |
+| `files` | Read, write, append, list, delete files | Restricted to `allowed_paths` in config |
+| `tavily_search` | Web search via Tavily API | Optional; requires Tavily API key |
+| `web_scrape` | Fetch and extract content from a URL | BeautifulSoup parsing, 15s timeout, 20K char limit |
+| `cron_create` | Create a scheduled task | Accepts name, cron expression, prompt, optional model |
+| `cron_edit` | Edit an existing scheduled task | Update name, schedule, prompt, and/or model by cron ID |
+| `cron_delete` | Delete a scheduled task | By cron ID |
+| `cron_list` | List all scheduled tasks | Returns schedule, status, last run info |
+
+## Architecture
+
+```
+Telegram Bot (python-telegram-bot)
+  |
+  v
+Context Manager (SQLite + FTS5 + sliding window)
+  |
+  v
+Model Router (OpenRouter API, semaphore-serialized, retry with backoff)
+  |
+  v
+Tools (ProcessPoolExecutor: shell, files, web search, web scrape, cron, vision)
+  |
+Cron Scheduler (APScheduler, SQLite-persisted, semaphore-gated)
+```
+
+Key design points:
+
+- Single async event loop with a ProcessPoolExecutor (4 workers) for blocking operations
+- `asyncio.Semaphore(1)` serializes all model API calls to prevent races
+- Heartbeat file touched every 30s; watchdog restarts if stale beyond 90s
+- Cron outputs are delivered to Telegram but do not enter conversation memory
+- Token counting uses tiktoken with a configurable safety margin for non-OpenAI models
+
+See [SPEC.md](SPEC.md) for the full specification including database schema, concurrency model, and design decisions.
+
+## Development
+
+### Install dev dependencies
+
+```bash
+pip install -e ".[dev]"
+```
+
+### Run tests
+
+```bash
+pytest
+```
+
+### Project structure
+
+```
+src/claw_phone/
+  __main__.py        # Entry point: setup / gateway
+  config.py          # Config loading
+  db.py              # SQLite connection, schema, migrations
+  context.py         # Sliding window context + FTS5 search
+  gateway.py         # Main async loop
+  setup_wizard.py    # Interactive onboarding
+  bot/
+    handler.py       # Message handler with queue
+    commands.py      # Telegram commands
+    voice.py         # Groq Whisper transcription
+  router/
+    openrouter.py    # OpenRouter API client
+    tool_loop.py     # Tool-use execution loop
+  tools/
+    registry.py      # Tool registration + JSON schemas
+    shell.py         # Shell execution
+    files.py         # File operations
+    tavily_search.py # Tavily Search API
+    web_scrape.py    # URL fetch + parsing
+    cron_tools.py    # Cron CRUD tools (create, edit, delete, list)
+  cron/
+    scheduler.py     # APScheduler setup
+    executor.py      # Cron job execution
+```
+
+## License
+
+TBD

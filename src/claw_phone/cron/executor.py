@@ -1,0 +1,175 @@
+"""Cron job execution — runs a prompt through the model router and delivers results via Telegram.
+
+Execution is semaphore-gated (via the OpenRouter client) so cron runs
+don't race with user messages.  Results are NOT stored in conversation
+memory — they are fire-and-forget messages to the owner.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
+
+from claw_phone.db import get_db
+from claw_phone.router.tool_loop import run_tool_loop
+
+if TYPE_CHECKING:
+    from claw_phone.gateway import AppState
+
+logger = logging.getLogger(__name__)
+
+# Telegram message length limit
+_TG_MAX_LENGTH = 4096
+
+
+async def execute_cron(
+    app_state: AppState,
+    cron_id: str,
+    prompt: str,
+    model: str | None,
+    tools_allowed: list[str] | None,
+) -> None:
+    """Execute a cron job: run the prompt through the tool loop and send the result to the owner.
+
+    Steps:
+        1. Resolve model (cron-specific → cron_default → default).
+        2. Build messages with system prompt + user prompt.
+        3. Get tool schemas, filtered by tools_allowed if set.
+        4. Run the tool loop.
+        5. Send result to owner via Telegram (chunked if needed).
+        6. Update cron_jobs row with last_run_at and last_result/last_error.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        # 1. Resolve model
+        resolved_model = (
+            model
+            or app_state.config.get("models.cron_default")
+            or app_state.config.get("models.default", "google/gemini-2.0-flash")
+        )
+
+        # 2. Build system prompt (includes IDENTITY.md, USER.md, SYSTEM.md)
+        from claw_phone.bot.handler import _build_system_prompt
+
+        system_prompt = await _build_system_prompt(app_state.config)
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+
+        # 3. Get tool schemas
+        tool_registry = app_state.config.get("_tool_registry")
+        # The tool registry is stored on app_state directly in real usage.
+        # Try the canonical attribute first, then fall back to config stash.
+        registry = getattr(app_state, "tool_registry", None) or tool_registry
+
+        tools: list[dict[str, Any]] = []
+        if registry is not None:
+            all_schemas = registry.get_schemas()
+            if tools_allowed is not None:
+                allowed_set = set(tools_allowed)
+                tools = [
+                    s
+                    for s in all_schemas
+                    if s.get("function", {}).get("name") in allowed_set
+                ]
+            else:
+                tools = all_schemas
+
+        # 4. Get the OpenRouter client
+        router_client = getattr(app_state, "router_client", None)
+        if router_client is None:
+            raise RuntimeError("OpenRouter client not available on app_state")
+
+        # 5. Run the tool loop
+        max_iterations = app_state.config.get("agent.max_tool_iterations", 20)
+        result = await run_tool_loop(
+            client=router_client,
+            messages=messages,
+            model=resolved_model,
+            tools=tools,
+            tool_registry=registry,
+            max_iterations=max_iterations,
+            executor=app_state.executor,
+        )
+
+        # 6. Send result to owner via Telegram
+        owner_id = app_state.config.get("telegram.owner_id")
+        if owner_id and app_state.application:
+            bot = app_state.application.bot
+            await _send_chunked(bot, owner_id, f"[cron:{cron_id}]\n{result}")
+
+        # 7. Update DB — success
+        await _update_cron_result(cron_id, now, result=result)
+        logger.info("Cron %s executed successfully", cron_id)
+
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        logger.error("Cron %s failed: %s", cron_id, error_msg, exc_info=True)
+
+        # Send error notification to owner
+        try:
+            owner_id = app_state.config.get("telegram.owner_id")
+            if owner_id and app_state.application:
+                bot = app_state.application.bot
+                await _send_chunked(
+                    bot,
+                    owner_id,
+                    f"\u26a0\ufe0f Cron {cron_id} failed:\n{error_msg}",
+                )
+        except Exception:
+            logger.exception("Failed to send cron error notification")
+
+        # Update DB — error
+        await _update_cron_result(cron_id, now, error=error_msg)
+
+
+async def _send_chunked(bot: Any, chat_id: int, text: str) -> None:
+    """Send a message to Telegram, splitting into chunks if it exceeds the limit."""
+    if len(text) <= _TG_MAX_LENGTH:
+        await bot.send_message(chat_id=chat_id, text=text)
+        return
+
+    # Split on newlines where possible, falling back to hard splits
+    remaining = text
+    while remaining:
+        if len(remaining) <= _TG_MAX_LENGTH:
+            await bot.send_message(chat_id=chat_id, text=remaining)
+            break
+
+        # Find the last newline within the limit
+        split_at = remaining.rfind("\n", 0, _TG_MAX_LENGTH)
+        if split_at == -1:
+            split_at = _TG_MAX_LENGTH
+
+        chunk = remaining[:split_at]
+        remaining = remaining[split_at:].lstrip("\n")
+        await bot.send_message(chat_id=chat_id, text=chunk)
+
+
+async def _update_cron_result(
+    cron_id: str,
+    run_time: str,
+    result: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Update the cron_jobs row with execution results."""
+    try:
+        db = await get_db()
+        if result is not None:
+            await db.execute(
+                "UPDATE cron_jobs SET last_run_at = ?, last_result = ?, last_error = NULL WHERE id = ?",
+                (run_time, result[:10000], cron_id),
+            )
+        elif error is not None:
+            await db.execute(
+                "UPDATE cron_jobs SET last_run_at = ?, last_error = ? WHERE id = ?",
+                (run_time, error[:10000], cron_id),
+            )
+        await db.commit()
+    except Exception:
+        logger.exception("Failed to update cron_jobs for %s", cron_id)

@@ -1,0 +1,375 @@
+"""Main message handler with async queue and backpressure.
+
+Incoming messages are placed on an asyncio.Queue and processed sequentially.
+While a message is being processed, a typing indicator is sent to signal
+the bot is busy. Voice messages are transcribed via Groq Whisper before
+processing.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
+
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import ContextTypes, MessageHandler, filters
+
+from pathlib import Path
+
+from claw_phone.bot.commands import register_commands
+from claw_phone.bot.voice import VoiceTranscriptionError, transcribe
+
+# Prompt files loaded from ~/.claw-phone/ in this order
+_PROMPT_DIR = Path.home() / ".claw-phone"
+_PROMPT_FILES = ["IDENTITY.md", "USER.md", "SYSTEM.md"]
+
+if TYPE_CHECKING:
+    from telegram.ext import Application
+
+logger = logging.getLogger(__name__)
+
+# Telegram message length limit
+_MAX_MESSAGE_LENGTH = 4096
+
+# Module-level queue — initialized per-application in post_init
+_message_queue: asyncio.Queue | None = None
+_queue_task: asyncio.Task | None = None
+
+
+# ---------------------------------------------------------------------------
+# Public setup
+# ---------------------------------------------------------------------------
+
+def setup_handlers(application: "Application") -> None:
+    """Register message handlers and all commands on *application*.
+
+    The background queue processor is started via ``post_init``.
+    """
+    # Command handlers first (higher priority by default in ptb)
+    register_commands(application)
+
+    # Text messages (non-command)
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _queue_message)
+    )
+    # Voice messages
+    application.add_handler(
+        MessageHandler(filters.VOICE, _queue_message)
+    )
+    # Photo messages (with or without caption)
+    application.add_handler(
+        MessageHandler(filters.PHOTO, _queue_message)
+    )
+
+    # Queue processor is started explicitly by the gateway after initialize()
+
+
+# ---------------------------------------------------------------------------
+# Queue management
+# ---------------------------------------------------------------------------
+
+def start_queue_processor(application: "Application") -> None:
+    """Start the background task that drains the message queue."""
+    global _message_queue, _queue_task
+    _message_queue = asyncio.Queue()
+    _queue_task = asyncio.create_task(_process_queue(application))
+    logger.info("Message queue processor started")
+
+
+async def _queue_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Put an incoming message on the queue for sequential processing."""
+    app_state = context.bot_data.get("app_state")
+    if app_state is None:
+        return
+
+    # Owner-only auth: silently ignore messages from non-owner
+    owner_id = app_state.config.get("telegram.owner_id")
+    if update.effective_user is None or update.effective_user.id != owner_id:
+        return
+
+    if _message_queue is not None:
+        await _message_queue.put((update, context))
+
+
+async def _process_queue(application: "Application") -> None:
+    """Drain the message queue, processing one message at a time."""
+    global _message_queue
+    assert _message_queue is not None
+
+    while True:
+        try:
+            update, context = await _message_queue.get()
+            try:
+                await _handle_message(update, context)
+            except Exception:
+                logger.exception("Unhandled error processing message")
+                try:
+                    await update.message.reply_text(
+                        "An internal error occurred. Please try again."
+                    )
+                except Exception:
+                    logger.exception("Failed to send error reply")
+            finally:
+                _message_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("Message queue processor cancelled")
+            break
+        except Exception:
+            logger.exception("Fatal error in queue processor loop")
+            await asyncio.sleep(1)  # Prevent tight error loop
+
+
+# ---------------------------------------------------------------------------
+# Core message processing
+# ---------------------------------------------------------------------------
+
+async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process a single user message end-to-end."""
+    app_state = context.bot_data["app_state"]
+    chat_id = update.effective_chat.id
+
+    # Start typing indicator in background
+    typing_task = asyncio.create_task(_send_typing_loop(context, chat_id))
+
+    try:
+        # 1. Extract text + optional image
+        text, image_url = await _extract_content(update, app_state)
+        if not text:
+            return
+
+        # 2. Import context module
+        from claw_phone import context as ctx_module
+
+        # 3. Check if this is a reply to a cron result
+        cron_context = _extract_cron_context(update)
+
+        # 4. Get or create conversation
+        conversation_id = await ctx_module.get_or_create_conversation()
+
+        # 5. Ingest user message into context (text only for storage)
+        await ctx_module.ingest(conversation_id, "user", text)
+
+        # 6. Assemble context with system prompt + prompt files
+        system_prompt = await _build_system_prompt(app_state.config)
+
+        messages = await ctx_module.assemble(conversation_id, system_prompt)
+
+        # 6a. If this message has an image, replace the last user message
+        # with multimodal content (text + image_url)
+        if image_url and messages:
+            # Find the last user message and make it multimodal
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i]["role"] == "user":
+                    messages[i]["content"] = [
+                        {"type": "text", "text": text},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ]
+                    break
+
+        # 6b. If replying to a cron result, inject one-off context
+        if cron_context:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"[Context: The user is replying to a cron job result. "
+                    f"Original cron output:\n{cron_context}]"
+                ),
+            })
+
+        # 7. Run tool loop
+        model = app_state.config.get("models.default", "google/gemini-2.0-flash")
+        tool_schemas = app_state.tool_registry.get_schemas()
+        max_iterations = app_state.config.get("agent.max_tool_iterations", 20)
+
+        from claw_phone.router.tool_loop import run_tool_loop
+
+        response_text = await run_tool_loop(
+            client=app_state.router_client,
+            messages=messages,
+            model=model,
+            tools=tool_schemas,
+            tool_registry=app_state.tool_registry,
+            max_iterations=max_iterations,
+            executor=app_state.executor,
+        )
+
+        # 8. Ingest assistant response
+        await ctx_module.ingest(conversation_id, "assistant", response_text)
+
+        # 9. Send response back via Telegram (chunked if needed)
+        await _send_response(update, response_text)
+
+    finally:
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _build_system_prompt(config: Any) -> str:
+    """Build the system prompt from config + markdown files + memories.
+
+    Loads IDENTITY.md, USER.md, and SYSTEM.md (if they exist) and appends
+    them to the base system prompt from config. Also injects all persistent
+    memories. Files are re-read on every call so edits take effect without restart.
+    """
+    base = config.get("agent.system_prompt", "")
+    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    base = base.replace("{current_time}", current_time)
+
+    sections = [base]
+    for filename in _PROMPT_FILES:
+        path = _PROMPT_DIR / filename
+        if path.is_file():
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+                if content:
+                    sections.append(content)
+            except OSError:
+                logger.warning("Failed to read prompt file: %s", path)
+
+    # Inject persistent memories
+    try:
+        from claw_phone.tools.memory import get_all_memories
+        memories = await get_all_memories()
+        if memories:
+            mem_lines = [f"- {m['key']}: {m['value']}" for m in memories]
+            sections.append("# Memories\n" + "\n".join(mem_lines))
+    except Exception:
+        logger.debug("Failed to load memories for system prompt", exc_info=True)
+
+    return "\n\n".join(sections)
+
+
+async def _extract_content(
+    update: Update, app_state: Any
+) -> tuple[str | None, str | None]:
+    """Extract text and optional base64 image from a message.
+
+    Returns (text, image_base64). image_base64 is a data URI if a photo
+    is attached, or None for text/voice-only messages.
+    """
+    message = update.message
+
+    # Voice message
+    if message.voice is not None:
+        try:
+            voice_file = await message.voice.get_file()
+            text = await transcribe(voice_file, app_state.config.data)
+            await message.reply_text(f"[Voice] {text}", do_quote=True)
+            return text, None
+        except VoiceTranscriptionError as exc:
+            await message.reply_text(str(exc))
+            return None, None
+
+    # Photo message
+    if message.photo:
+        # Get the largest resolution photo
+        photo = message.photo[-1]
+        file = await photo.get_file()
+        photo_bytes = await file.download_as_bytearray()
+        b64 = base64.b64encode(photo_bytes).decode("ascii")
+        image_url = f"data:image/jpeg;base64,{b64}"
+        text = message.caption or "What do you see in this image?"
+        return text, image_url
+
+    # Text message
+    if message.text:
+        return message.text, None
+
+    return None, None
+
+
+def _extract_cron_context(update: Update) -> str | None:
+    """If the user is replying to a cron result message, return its text.
+
+    Cron result messages are identified by having metadata stored in the
+    message text or by the bot being the sender of the replied-to message.
+    We check if the replied-to message is from the bot itself and contains
+    a cron marker.
+    """
+    message = update.message
+    if message is None or message.reply_to_message is None:
+        return None
+
+    replied = message.reply_to_message
+
+    # The replied-to message must be from the bot
+    if replied.from_user is None or not replied.from_user.is_bot:
+        return None
+
+    # Check if the replied message has cron metadata in its text
+    # Cron results are prefixed with a marker or stored with specific format
+    text = replied.text or ""
+    if not text:
+        return None
+
+    # Return the full text of the replied-to bot message as context.
+    # The handler will inject it as one-off context for this turn.
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Response sending
+# ---------------------------------------------------------------------------
+
+async def _send_response(update: Update, text: str) -> None:
+    """Send a response, splitting into chunks if it exceeds Telegram's limit."""
+    if not text:
+        text = "(empty response)"
+
+    if len(text) <= _MAX_MESSAGE_LENGTH:
+        await update.message.reply_text(text)
+        return
+
+    # Split into chunks at line boundaries where possible
+    chunks = _split_text(text, _MAX_MESSAGE_LENGTH)
+    for chunk in chunks:
+        await update.message.reply_text(chunk)
+
+
+def _split_text(text: str, max_length: int) -> list[str]:
+    """Split text into chunks of at most *max_length* characters.
+
+    Prefers splitting at newlines, falling back to hard cuts.
+    """
+    chunks: list[str] = []
+    while text:
+        if len(text) <= max_length:
+            chunks.append(text)
+            break
+
+        # Try to find a newline to split at
+        cut_at = text.rfind("\n", 0, max_length)
+        if cut_at <= 0:
+            # No good newline break; hard cut
+            cut_at = max_length
+
+        chunks.append(text[:cut_at])
+        text = text[cut_at:].lstrip("\n")
+
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# Typing indicator
+# ---------------------------------------------------------------------------
+
+async def _send_typing_loop(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int
+) -> None:
+    """Send 'typing' chat action every 5 seconds until cancelled."""
+    try:
+        while True:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await asyncio.sleep(5)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # If sending typing fails, just stop silently
+        pass

@@ -1,0 +1,129 @@
+"""Tool-use execution loop for multi-turn function calling."""
+
+from __future__ import annotations
+
+import json
+import logging
+from concurrent.futures import ProcessPoolExecutor
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from claw_phone.router.openrouter import OpenRouterClient
+    from claw_phone.tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+
+async def run_tool_loop(
+    client: "OpenRouterClient",
+    messages: list[dict[str, Any]],
+    model: str,
+    tools: list[dict[str, Any]],
+    tool_registry: "ToolRegistry",
+    max_iterations: int = 20,
+    executor: ProcessPoolExecutor | None = None,
+) -> str:
+    """Run the model in a tool-calling loop until it produces a final text response.
+
+    Each iteration:
+      1. Call the model with the current messages and tool definitions.
+      2. If the model returns tool_calls, execute each one and append results.
+      3. If the model returns plain text (no tool_calls), return it.
+      4. Repeat up to ``max_iterations`` times.
+
+    Tool execution errors are caught and returned to the model as error
+    strings so it can attempt recovery.
+
+    Args:
+        client: OpenRouter API client.
+        messages: Conversation messages (mutated in place with tool calls/results).
+        model: Model identifier for OpenRouter.
+        tools: Tool JSON schemas in OpenAI function-calling format.
+        tool_registry: Registry that resolves and executes tool functions.
+        max_iterations: Safety cap on tool-call rounds (default 20).
+        executor: Optional ProcessPoolExecutor for blocking tool functions.
+
+    Returns:
+        The final text content from the model.
+    """
+    for iteration in range(1, max_iterations + 1):
+        response = await client.chat(messages, model, tools)
+
+        choice = response["choices"][0]
+        assistant_message = choice["message"]
+
+        # Check for tool calls
+        tool_calls = assistant_message.get("tool_calls")
+
+        if not tool_calls:
+            # No tool calls — return the text content
+            content = assistant_message.get("content", "")
+            return content or ""
+
+        # Append the assistant message (with tool_calls) to the conversation
+        messages.append(assistant_message)
+
+        # Execute each tool call
+        for tool_call in tool_calls:
+            call_id = tool_call["id"]
+            function = tool_call["function"]
+            name = function["name"]
+            raw_args = function.get("arguments", "{}")
+
+            # Parse arguments — models sometimes return a string
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except json.JSONDecodeError:
+                args = {}
+                logger.warning(
+                    "Iteration %d: failed to parse args for tool %s: %s",
+                    iteration,
+                    name,
+                    raw_args,
+                )
+
+            # Execute the tool, catching any exception
+            try:
+                result = await tool_registry.execute(name, args, executor)
+                result_str = str(result) if not isinstance(result, str) else result
+                logger.info(
+                    "Iteration %d: tool %s executed successfully", iteration, name
+                )
+            except Exception as exc:
+                result_str = f"Error executing tool {name}: {exc}"
+                logger.error(
+                    "Iteration %d: tool %s failed: %s",
+                    iteration,
+                    name,
+                    exc,
+                    exc_info=True,
+                )
+
+            # Append tool result to messages
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result_str,
+                }
+            )
+
+    # Exhausted max_iterations — make one final call without tools to get a
+    # text summary from the model, or return a fallback error.
+    logger.warning(
+        "Tool loop reached max iterations (%d), requesting final response",
+        max_iterations,
+    )
+    try:
+        response = await client.chat(messages, model)
+        choice = response["choices"][0]
+        content = choice["message"].get("content", "")
+        if content:
+            return content
+    except Exception as exc:
+        logger.error("Final call after max iterations failed: %s", exc)
+
+    return (
+        f"Reached the maximum of {max_iterations} tool iterations "
+        "without a final response."
+    )
