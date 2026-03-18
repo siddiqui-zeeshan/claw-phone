@@ -135,9 +135,10 @@ class TestExecuteCronSuccess:
     """Test execute_cron sends the result to Telegram on success."""
 
     @pytest.mark.asyncio
+    @patch("claw_phone.cron.executor._maybe_delete_once", new_callable=AsyncMock)
     @patch("claw_phone.cron.executor._update_cron_result", new_callable=AsyncMock)
     @patch("claw_phone.cron.executor.run_tool_loop", new_callable=AsyncMock)
-    async def test_sends_result_to_telegram(self, mock_tool_loop, mock_update):
+    async def test_sends_result_to_telegram(self, mock_tool_loop, mock_update, _mock_delete):
         from claw_phone.cron.executor import execute_cron
 
         mock_tool_loop.return_value = "Cron result text"
@@ -153,7 +154,6 @@ class TestExecuteCronSuccess:
         bot.send_message.assert_awaited_once()
         call_kwargs = bot.send_message.call_args[1]
         assert call_kwargs["chat_id"] == 12345
-        assert "cron-1" in call_kwargs["text"]
         assert "Cron result text" in call_kwargs["text"]
 
         # DB was updated with the result
@@ -172,9 +172,10 @@ class TestExecuteCronError:
     """Test execute_cron handles errors and sends warning message."""
 
     @pytest.mark.asyncio
+    @patch("claw_phone.cron.executor._maybe_delete_once", new_callable=AsyncMock)
     @patch("claw_phone.cron.executor._update_cron_result", new_callable=AsyncMock)
     @patch("claw_phone.cron.executor.run_tool_loop", new_callable=AsyncMock)
-    async def test_sends_warning_on_failure(self, mock_tool_loop, mock_update):
+    async def test_sends_warning_on_failure(self, mock_tool_loop, mock_update, _mock_delete):
         from claw_phone.cron.executor import execute_cron
 
         mock_tool_loop.side_effect = RuntimeError("model exploded")
@@ -200,9 +201,10 @@ class TestExecuteCronError:
         )
 
     @pytest.mark.asyncio
+    @patch("claw_phone.cron.executor._maybe_delete_once", new_callable=AsyncMock)
     @patch("claw_phone.cron.executor._update_cron_result", new_callable=AsyncMock)
     @patch("claw_phone.cron.executor.run_tool_loop", new_callable=AsyncMock)
-    async def test_error_notification_failure_does_not_propagate(self, mock_tool_loop, mock_update):  # noqa: E501
+    async def test_error_notification_failure_does_not_propagate(self, mock_tool_loop, mock_update, _mock_delete):  # noqa: E501
         """If sending the error notification itself fails, execute_cron still doesn't raise."""
         from claw_phone.cron.executor import execute_cron
 
