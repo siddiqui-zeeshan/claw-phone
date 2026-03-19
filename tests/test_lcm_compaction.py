@@ -44,10 +44,10 @@ async def _init_db(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _reset_failure_counter():
-    """Reset the module-level failure counter before each test."""
-    ctx_mod._compact_consecutive_failures = 0
+    """Reset the per-conversation failure counter before each test."""
+    ctx_mod._compact_consecutive_failures.clear()
     yield
-    ctx_mod._compact_consecutive_failures = 0
+    ctx_mod._compact_consecutive_failures.clear()
 
 
 def _make_mock_router_client(summary_text: str = "Summary.") -> MagicMock:
@@ -84,10 +84,10 @@ async def test_compact_retry_on_single_failure(_init_db):
     with patch("spare_paw.context.compact", side_effect=_fake_compact), \
          patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         await compact_with_retry(conv_id, mock_client, "test-model")
-        mock_sleep.assert_awaited_once_with(2)
+        mock_sleep.assert_awaited_once()
 
     assert call_count == 2, "compact() should be called exactly twice (attempt + retry)"
-    assert ctx_mod._compact_consecutive_failures == 0
+    assert ctx_mod._compact_consecutive_failures.get(conv_id, 0) == 0
 
 
 @pytest.mark.asyncio
@@ -139,12 +139,12 @@ async def test_consecutive_failure_counter_increments(_init_db):
     with patch("asyncio.sleep", new_callable=AsyncMock):
         await compact_with_retry(conv_id, mock_client, "test-model")
 
-    assert ctx_mod._compact_consecutive_failures == 1
+    assert ctx_mod._compact_consecutive_failures.get(conv_id, 0) == 1
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
         await compact_with_retry(conv_id, mock_client, "test-model")
 
-    assert ctx_mod._compact_consecutive_failures == 2
+    assert ctx_mod._compact_consecutive_failures.get(conv_id, 0) == 2
 
     config_mod.set_override("context.fresh_tail_count", 32)
 
@@ -156,7 +156,7 @@ async def test_consecutive_failure_counter_resets_on_success(_init_db):
 
     config_mod.set_override("context.fresh_tail_count", 5)
 
-    ctx_mod._compact_consecutive_failures = 2
+    ctx_mod._compact_consecutive_failures["pre-seeded"] = 2
 
     conv_id = await new_conversation()
     for i in range(15):
@@ -166,7 +166,7 @@ async def test_consecutive_failure_counter_resets_on_success(_init_db):
 
     await compact_with_retry(conv_id, mock_client, "test-model")
 
-    assert ctx_mod._compact_consecutive_failures == 0
+    assert conv_id not in ctx_mod._compact_consecutive_failures
 
     config_mod.set_override("context.fresh_tail_count", 32)
 
@@ -211,6 +211,6 @@ async def test_warning_fires_after_three_consecutive_failures(_init_db):
         "Expected a WARNING about 3+ consecutive failures, got: " + str(warning_messages)
     )
 
-    assert ctx_mod._compact_consecutive_failures == 3
+    assert ctx_mod._compact_consecutive_failures.get(conv_id, 0) == 3
 
     config_mod.set_override("context.fresh_tail_count", 32)

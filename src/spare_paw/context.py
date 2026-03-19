@@ -31,9 +31,10 @@ logger = logging.getLogger(__name__)
 # Cache the tiktoken encoder at module level
 _encoder: tiktoken.Encoding | None = None
 
-# Consecutive compaction failure counter (resets on success)
-_compact_consecutive_failures: int = 0
+# Per-conversation compaction failure counter (resets on success)
+_compact_consecutive_failures: dict[str, int] = {}
 _COMPACT_FAILURE_WARN_THRESHOLD: int = 3
+_COMPACT_RETRY_DELAY_SECONDS: float = 2
 
 
 def _get_encoder() -> tiktoken.Encoding:
@@ -319,17 +320,17 @@ async def compact_with_retry(
 ) -> None:
     """Run LCM compaction with error handling and one retry on failure.
 
-    - On first failure: logs WARNING, waits 2 seconds, retries once.
+    - On first failure: logs WARNING, waits before retrying once.
     - On retry failure: logs ERROR, skips compaction for this cycle.
-    - Tracks consecutive failures; logs a distinct WARNING at >= 3.
+    - Tracks consecutive failures per conversation; logs WARNING at >= 3.
     - Resets the failure counter on success.
-    - Source messages are never deleted on failure.
+    - Source messages are never deleted on failure. Partial summary nodes
+      may persist from a failed attempt; the next successful compaction
+      will handle remaining uncovered messages.
     """
-    global _compact_consecutive_failures
-
     try:
         await compact(conversation_id, router_client, model)
-        _compact_consecutive_failures = 0
+        _compact_consecutive_failures.pop(conversation_id, None)
         return
     except Exception as exc:
         logger.warning(
@@ -337,23 +338,24 @@ async def compact_with_retry(
             conversation_id, exc,
         )
 
-    await asyncio.sleep(2)
+    await asyncio.sleep(_COMPACT_RETRY_DELAY_SECONDS)
 
     try:
         await compact(conversation_id, router_client, model)
-        _compact_consecutive_failures = 0
+        _compact_consecutive_failures.pop(conversation_id, None)
         return
     except Exception as exc:
-        _compact_consecutive_failures += 1
+        count = _compact_consecutive_failures.get(conversation_id, 0) + 1
+        _compact_consecutive_failures[conversation_id] = count
         logger.error(
             "LCM compaction failed (attempt 2/2) for conversation %s: %s — "
             "skipping this cycle (consecutive failures: %d)",
-            conversation_id, exc, _compact_consecutive_failures,
+            conversation_id, exc, count,
         )
-        if _compact_consecutive_failures >= _COMPACT_FAILURE_WARN_THRESHOLD:
+        if count >= _COMPACT_FAILURE_WARN_THRESHOLD:
             logger.warning(
-                "LCM compaction has failed %d+ times consecutively",
-                _COMPACT_FAILURE_WARN_THRESHOLD,
+                "LCM compaction has failed %d+ times consecutively for conversation %s",
+                _COMPACT_FAILURE_WARN_THRESHOLD, conversation_id,
             )
 
 
