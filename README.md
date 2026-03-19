@@ -7,6 +7,7 @@ A 24/7 personal AI agent running on a rooted Android phone via Termux, accessibl
 - **Multi-model routing** -- configure model slots (default, smart, cron) via OpenRouter; switch on the fly
 - **Tool use** -- shell commands, file operations, web search, web scraping, cron management; all exposed as LLM function calls
 - **Scheduled tasks (cron)** -- create, edit, pause, resume, and manage recurring AI tasks with per-cron model selection
+- **One-shot reminders** -- ask the bot to remind you of something in X minutes/hours; it creates a cron that fires once and auto-deletes itself (e.g. "remind me to call John in 30 minutes")
 - **Photo/image support** -- send photos via Telegram; they are base64-encoded and forwarded to the model as multimodal vision messages. Caption is used as the prompt (defaults to "What do you see in this image?")
 - **Voice messages** -- Groq Whisper transcription for Telegram voice notes
 - **Prompt files** -- loads `IDENTITY.md`, `USER.md`, and `SYSTEM.md` from `~/.spare-paw/` on every turn for personality, user preferences, and device context. Editable live without restart
