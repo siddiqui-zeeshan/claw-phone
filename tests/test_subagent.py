@@ -497,7 +497,7 @@ async def test_tool_loop_to_spawn_handler_integration():
     mock_client.chat = AsyncMock(return_value=batch_response)
 
     with patch.object(subagent_mod, "_run_agent", side_effect=_noop_run_agent):
-        result = await run_tool_loop(
+        await run_tool_loop(
             client=mock_client,
             messages=[{"role": "user", "content": "do two things"}],
             model="m",
