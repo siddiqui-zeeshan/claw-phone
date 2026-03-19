@@ -325,6 +325,19 @@ async def _async_main() -> None:
 
     # 16. Start the bot
     await application.initialize()
+
+    # Set Telegram bot command menu
+    from telegram import BotCommand
+    await application.bot.set_my_commands([
+        BotCommand("cron", "Manage scheduled tasks (list, remove, pause, resume, info)"),
+        BotCommand("config", "Show or change runtime config"),
+        BotCommand("status", "Uptime, memory, DB size, active crons"),
+        BotCommand("search", "Full-text search over conversation history"),
+        BotCommand("forget", "Start a new conversation"),
+        BotCommand("model", "Switch the active model"),
+        BotCommand("mcp", "List connected MCP servers and tools"),
+    ])
+
     await application.start()
 
     # 17. Start message queue processor (must be after initialize/start)
