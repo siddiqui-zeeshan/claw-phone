@@ -232,10 +232,6 @@ After 100+ messages in a conversation, the bot had compressed history into 12 DA
 2. Used `lcm_expand` to drill into matching summary nodes and recover original messages
 3. Recalled specific details from early in the conversation that would have been lost with a flat sliding window
 
-### Why not MCP?
-
-The official GitHub MCP server works (`npx @modelcontextprotocol/server-github`), but it pulls in Node.js and adds startup latency. Since `gh` CLI covers the same surface area and is already available as a shell command, there's nothing extra to configure or run.
-
 ## Architecture
 
 ```
