@@ -101,3 +101,71 @@ class TestMdToHtml:
         assert "&lt;" in result
         assert "&gt;" in result
         assert "<=" not in result.replace("&lt;=", "")
+
+    def test_inline_code_escapes_html_chars(self):
+        """< and > inside inline code must be escaped."""
+        result = _md_to_html("`a < b && c > d`")
+        assert "<code>" in result
+        assert "&lt;" in result
+        assert "&gt;" in result
+        assert "&amp;" in result
+
+    def test_multiple_code_blocks(self):
+        """Multiple code blocks in one message should all be preserved."""
+        md = "First:\n```python\nx = 1\n```\nSecond:\n```js\ny = 2\n```"
+        result = _md_to_html(md)
+        assert "x = 1" in result
+        assert "y = 2" in result
+        assert result.count("<pre>") == 2
+
+    def test_empty_input(self):
+        assert _md_to_html("") == ""
+
+    def test_ampersand_in_text(self):
+        """Ampersands in regular text must be escaped."""
+        result = _md_to_html("AT&T and H&M")
+        assert "AT&amp;T" in result
+        assert "H&amp;M" in result
+
+    def test_numbered_list(self):
+        """Numbered lists should pass through without breaking."""
+        md = "1. First item\n2. Second item\n3. Third item"
+        result = _md_to_html(md)
+        assert "1. First item" in result
+        assert "3. Third item" in result
+
+    def test_bold_italic_combined(self):
+        """***bold italic*** should produce nested tags."""
+        result = _md_to_html("***hello***")
+        assert "<b>" in result or "<i>" in result
+        assert "hello" in result
+
+    def test_inline_code_not_formatted(self):
+        """Bold/italic markers inside inline code should not be converted."""
+        result = _md_to_html("`**not bold**`")
+        assert "<b>" not in result
+        assert "<code>" in result
+
+    def test_real_world_llm_response(self):
+        """A realistic multi-paragraph LLM response with mixed formatting."""
+        md = (
+            "## Summary\n\n"
+            "Here's what I found:\n\n"
+            "**Model A** costs `$0.50` per million tokens. "
+            "See [pricing](https://example.com/pricing).\n\n"
+            "```python\ndef calc(n):\n    return n * 0.50\n```\n\n"
+            "| Model | Cost |\n|-------|------|\n| A | $0.50 |\n| B | $1.00 |\n\n"
+            "~~Old pricing~~ is no longer valid."
+        )
+        result = _md_to_html(md)
+        assert "<b>Summary</b>" in result
+        assert "<b>Model A</b>" in result
+        assert "<code>$0.50</code>" in result
+        assert '<a href="https://example.com/pricing">' in result
+        assert "<pre><code" in result
+        assert "<s>Old pricing</s>" in result
+        # Should not contain any raw < or > outside of tags
+        import re
+        # Strip all valid HTML tags, check nothing raw remains
+        stripped = re.sub(r"<[a-z/][^>]*>", "", result)
+        assert "<" not in stripped, f"Unescaped < found in: {stripped}"
