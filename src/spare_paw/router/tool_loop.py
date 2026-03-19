@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Per-turn (not per-session) call limits. Tools not listed are unlimited.
 DEFAULT_TOOL_LIMITS: dict[str, int] = {
     "web_scrape": 5,
     "web_search": 5,
@@ -32,7 +33,7 @@ async def run_tool_loop(
     max_iterations: int = 20,
     executor: ProcessPoolExecutor | None = None,
     track_usage: bool = False,
-    tool_limits: dict[str, int] | None = None,
+    tool_limits: dict[str, int | None] | None = None,
 ) -> str | tuple[str, dict[str, int]]:
     """Run the model in a tool-calling loop until it produces a final text response.
 
@@ -56,8 +57,8 @@ async def run_tool_loop(
         track_usage: If True, accumulate token usage across all API calls and
             return ``(response_text, usage_dict)`` instead of just the text.
         tool_limits: Per-tool call limits for this turn. Merged on top of
-            ``DEFAULT_TOOL_LIMITS``; set a key to override a default. Tools
-            not present in the merged dict are unlimited.
+            ``DEFAULT_TOOL_LIMITS``; set a value to override a default, or
+            ``None`` to remove a default limit (making the tool unlimited).
 
     Returns:
         The final text content from the model when ``track_usage`` is False.
@@ -65,9 +66,9 @@ async def run_tool_loop(
         *usage_dict* has keys ``prompt_tokens``, ``completion_tokens``, and
         ``total_tokens``.
     """
+    merged = {**DEFAULT_TOOL_LIMITS, **(tool_limits or {})}
     effective_limits: dict[str, int] = {
-        **DEFAULT_TOOL_LIMITS,
-        **(tool_limits or {}),
+        k: v for k, v in merged.items() if v is not None
     }
     call_counts: dict[str, int] = {}
 

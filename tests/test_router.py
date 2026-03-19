@@ -566,3 +566,33 @@ class TestRunToolLoop:
 
         assert result == "done"
         assert mock_registry.execute.call_count == call_count
+
+    @pytest.mark.asyncio
+    async def test_none_limit_removes_default(self):
+        """Setting a tool limit to None removes the default, making it unlimited."""
+        # shell has a default limit of 10; override with None to remove it
+        call_count = 12
+        mock_client = AsyncMock()
+        mock_client.chat = AsyncMock(
+            side_effect=[
+                _tool_call_response("shell", {"command": "ls"}, call_id=f"c{i}")
+                for i in range(call_count)
+            ]
+            + [_text_response("done")]
+        )
+
+        mock_registry = AsyncMock()
+        mock_registry.execute = AsyncMock(return_value="ok")
+
+        result = await run_tool_loop(
+            client=mock_client,
+            messages=[{"role": "user", "content": "go"}],
+            model="m",
+            tools=[{"type": "function", "function": {"name": "shell"}}],
+            tool_registry=mock_registry,
+            tool_limits={"shell": None},
+        )
+
+        assert result == "done"
+        # All 12 calls executed — default limit of 10 was removed
+        assert mock_registry.execute.call_count == call_count
