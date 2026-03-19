@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import ast
 import inspect
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from spare_paw.core.engine import split_text
+import pytest
+
+from spare_paw.backend import IncomingMessage
+from spare_paw.core.engine import process_message, split_text
 
 
 class TestSplitText:
@@ -46,6 +50,147 @@ class TestSplitText:
         chunks = split_text(text, 5)
         for chunk in chunks:
             assert not chunk.startswith("\n")
+
+
+def _make_app_state(response_text="Bot response."):
+    """Build a mock app_state with router_client, tool_registry, config, executor."""
+    app_state = MagicMock()
+    app_state.config.get = lambda key, default=None: {
+        "models.default": "test-model",
+        "agent.max_tool_iterations": 5,
+        "agent.system_prompt": "You are a test bot.",
+        "context.summary_model": "summary-model",
+    }.get(key, default)
+    app_state.tool_registry.get_schemas.return_value = []
+    app_state.router_client = MagicMock()
+    app_state.executor = None
+    return app_state
+
+
+def _make_backend():
+    """Build a mock MessageBackend."""
+    backend = AsyncMock()
+    return backend
+
+
+class TestProcessMessage:
+    @pytest.mark.asyncio
+    async def test_text_message(self):
+        """Text-only message: ingest, assemble, tool loop, send_text."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(text="hello")
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="Bot reply") as _mock_loop, \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="system prompt"), \
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock):
+            mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
+            mock_ctx.ingest = AsyncMock(return_value="msg-1")
+            mock_ctx.assemble = AsyncMock(return_value=[
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "hello"},
+            ])
+
+            await process_message(app_state, msg, backend)
+
+        # Verify user message ingested
+        mock_ctx.ingest.assert_any_await("conv-1", "user", "hello")
+        # Verify assistant response ingested
+        mock_ctx.ingest.assert_any_await("conv-1", "assistant", "Bot reply")
+        # Verify backend received markdown (not HTML)
+        backend.send_text.assert_awaited_once_with("Bot reply")
+
+    @pytest.mark.asyncio
+    async def test_voice_message(self):
+        """Voice message: transcribe bytes, then proceed as text."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(voice_bytes=b"\x00\x01\x02")
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="Voice reply"), \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
+             patch("spare_paw.core.engine.transcribe", new_callable=AsyncMock, return_value="transcribed text"), \
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock):
+            mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
+            mock_ctx.ingest = AsyncMock(return_value="msg-1")
+            mock_ctx.assemble = AsyncMock(return_value=[
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "transcribed text"},
+            ])
+
+            await process_message(app_state, msg, backend)
+
+        mock_ctx.ingest.assert_any_await("conv-1", "user", "transcribed text")
+        backend.send_text.assert_awaited_once_with("Voice reply")
+
+    @pytest.mark.asyncio
+    async def test_image_message(self):
+        """Image message: base64 encode, build multimodal content."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(image_bytes=b"\xff\xd8", caption="what is this?")
+
+        assembled = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "what is this?"},
+        ]
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="It's a photo") as _mock_loop, \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock):
+            mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
+            mock_ctx.ingest = AsyncMock(return_value="msg-1")
+            mock_ctx.assemble = AsyncMock(return_value=assembled)
+
+            await process_message(app_state, msg, backend)
+
+        # Check that the last user message was made multimodal
+        last_user = assembled[-1]
+        assert isinstance(last_user["content"], list)
+        assert last_user["content"][0]["type"] == "text"
+        assert last_user["content"][1]["type"] == "image_url"
+        assert "base64" in last_user["content"][1]["image_url"]["url"]
+
+    @pytest.mark.asyncio
+    async def test_cron_context_injected(self):
+        """Cron context is appended to assembled messages."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(text="looks good", cron_context="cron output here")
+
+        assembled = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "looks good"},
+        ]
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="Noted") as _mock_loop, \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock):
+            mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
+            mock_ctx.ingest = AsyncMock(return_value="msg-1")
+            mock_ctx.assemble = AsyncMock(return_value=assembled)
+
+            await process_message(app_state, msg, backend)
+
+        # Check cron context was injected
+        cron_msgs = [m for m in assembled if "cron" in m.get("content", "").lower()]
+        assert len(cron_msgs) >= 1
+        assert "cron output here" in cron_msgs[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_empty_text_returns_early(self):
+        """Message with no text/voice/image should return without calling backend."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage()
+
+        await process_message(app_state, msg, backend)
+
+        backend.send_text.assert_not_awaited()
 
 
 class TestNoTelegramImport:
