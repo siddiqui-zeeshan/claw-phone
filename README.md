@@ -187,6 +187,22 @@ Fix issue #11 in our repo — it's about adding a dependency lockfile
 Review PR #13 and leave comments
 ```
 
+### Real example: autonomous issue fix + PR review
+
+When asked to fix a known issue ("no dependency lockfile"), the bot autonomously:
+
+1. Installed `gh` CLI on its own (`pkg install gh`)
+2. Listed issues via `gh issue list`
+3. Cloned the repo and created branch `fix/add-dependency-lockfile`
+4. Read `pyproject.toml`, ran `pip-compile` to generate `requirements.txt`
+5. Committed, pushed, and created [PR #13](https://github.com/siddiqui-zeeshan/spare-paw/pull/13)
+6. Then when asked to review its own PR, spawned a background agent that:
+   - Fetched the PR branch and read the lockfile
+   - Cross-checked Python imports across the codebase against the lockfile
+   - Left a review comment: *"Looks good. One minor observation: ensure pytest and pytest-asyncio are included if you intend to run tests in the CI pipeline."*
+
+All from two Telegram messages. No human intervention after the initial prompt.
+
 ### Why not MCP?
 
 The official GitHub MCP server works (`npx @modelcontextprotocol/server-github`), but it pulls in Node.js and adds startup latency. Since `gh` CLI covers the same surface area and is already available as a shell command, there's nothing extra to configure or run.
