@@ -57,7 +57,7 @@ def execute_shell(
     This is a **synchronous** function — it will be dispatched to a
     ``ProcessPoolExecutor`` by the tool registry.
     """
-    logger.info("shell: executing (timeout=%ds): %s", timeout, redact_secrets(command[:200]))
+    logger.info("shell: executing (timeout=%ds): %s", timeout, redact_secrets(command)[:200])
 
     try:
         proc = subprocess.run(
@@ -86,7 +86,7 @@ def execute_shell(
         )
 
     except subprocess.TimeoutExpired:
-        logger.warning("shell: command timed out after %ds: %s", timeout, redact_secrets(command[:200]))
+        logger.warning("shell: command timed out after %ds: %s", timeout, redact_secrets(command)[:200])
         return json.dumps(
             {
                 "error": f"Command timed out after {timeout}s",
