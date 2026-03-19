@@ -141,8 +141,8 @@ async def _run_agent(
         else:
             tool_schemas = all_schemas
 
-        # Agents cannot spawn other agents
-        _agent_tools = {"spawn_agent", "list_agents"}
+        # Agents cannot spawn other agents or message the user directly
+        _agent_tools = {"spawn_agent", "list_agents", "send_message", "send_file"}
         tool_schemas = [
             s for s in tool_schemas
             if s.get("function", {}).get("name") not in _agent_tools
@@ -190,10 +190,6 @@ async def _run_agent(
                 logger.exception("Failed to notify main agent for group %s", group_id)
 
 
-_last_spawn_time: float = 0  # monotonic time of last successful spawn
-_last_group_id: str | None = None  # group_id from the most recent spawn
-
-
 async def _handle_spawn(
     app_state: Any,
     name: str,
@@ -205,23 +201,6 @@ async def _handle_spawn(
     group_id: str | None = None,
 ) -> str:
     """Spawn a background agent."""
-    global _last_spawn_time, _last_group_id
-    import time
-
-    now = time.monotonic()
-    elapsed = now - _last_spawn_time
-
-    # Auto-group: spawns within 5 seconds of each other share a group
-    if elapsed < 5 and _last_group_id is not None and group_id is None:
-        group_id = _last_group_id
-
-    # Rate limit: max 1 spawn per 30 seconds (skip if part of a group batch)
-    if elapsed < 30 and group_id is None:
-        return json.dumps({
-            "status": "rate_limited",
-            "message": "An agent was just spawned. Do NOT spawn another. Reply to the user now.",
-        })
-
     # Check concurrency limit
     running = sum(1 for a in _agents.values() if a["status"] == "running")
     if running >= _MAX_CONCURRENT:
@@ -260,10 +239,6 @@ async def _handle_spawn(
         "agent_type": agent_type,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-
-    # Mark spawn time and group for auto-grouping
-    _last_spawn_time = now
-    _last_group_id = resolved_group_id
 
     # Launch as background task
     asyncio.create_task(
@@ -358,11 +333,12 @@ def register(registry: Any, config: dict[str, Any], app_state: Any) -> None:
         tools: list[str] | None = None,
         max_iterations: int = 15,
         agent_type: str | None = None,
+        group_id: str | None = None,
     ) -> str:
         return await _handle_spawn(
             app_state, name=name, prompt=prompt,
             model=model, tools=tools, max_iterations=max_iterations,
-            agent_type=agent_type,
+            agent_type=agent_type, group_id=group_id,
         )
 
     registry.register(
@@ -370,7 +346,7 @@ def register(registry: Any, config: dict[str, Any], app_state: Any) -> None:
         description=(
             "Spawn a background agent that works independently and reports results back to you. "
             "For multi-part requests, spawn MULTIPLE agents in parallel (one per subtask, max 3) "
-            "in a SINGLE tool-call batch — they auto-group and results are delivered together. "
+            "in a SINGLE tool-call batch — batch-based grouping ensures results are delivered together. "
             "Use agent_type for specialization: 'researcher' (web search), 'coder' (shell/files), "
             "'analyst' (data analysis). Give each agent a focused, self-contained prompt. "
             "Do NOT spawn for simple questions or single tool calls — handle those directly."
