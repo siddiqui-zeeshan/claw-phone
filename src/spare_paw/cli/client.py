@@ -128,6 +128,20 @@ class RemoteClient:
             resp.raise_for_status()
             return await resp.json()
 
+    async def history(self, limit: int = 10) -> list[dict[str, Any]]:
+        """GET /history, returns recent conversation messages."""
+        session = self._get_session()
+        async with session.get(
+            f"{self._url}/history",
+            params={"limit": str(limit)},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status == 401:
+                raise PermissionError("Authentication failed — check remote.secret")
+            resp.raise_for_status()
+            data = await resp.json()
+            return data.get("messages", [])
+
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
             await self._session.close()

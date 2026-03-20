@@ -331,3 +331,73 @@ class TestSendMessageWithImage:
         call_args = mock_session.post.call_args
         payload = call_args[1]["json"]
         assert "image" not in payload
+
+
+class TestRemoteClientHistory:
+    @pytest.mark.asyncio
+    async def test_history_returns_messages(self):
+        client = RemoteClient(url="http://localhost:8080")
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.get = MagicMock(
+            return_value=_make_response(
+                200,
+                {"messages": [
+                    {"role": "user", "content": "hello", "created_at": "2026-03-20T10:00:00"},
+                    {"role": "assistant", "content": "hi", "created_at": "2026-03-20T10:00:01"},
+                ]},
+            )
+        )
+        client._session = mock_session
+
+        msgs = await client.history(limit=10)
+        assert len(msgs) == 2
+        assert msgs[0]["role"] == "user"
+        assert msgs[1]["role"] == "assistant"
+
+    @pytest.mark.asyncio
+    async def test_history_calls_history_endpoint(self):
+        client = RemoteClient(url="http://localhost:8080")
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.get = MagicMock(
+            return_value=_make_response(200, {"messages": []})
+        )
+        client._session = mock_session
+
+        await client.history(limit=5)
+
+        call_url = mock_session.get.call_args[0][0]
+        assert "/history" in call_url
+
+    @pytest.mark.asyncio
+    async def test_history_passes_limit_param(self):
+        client = RemoteClient(url="http://localhost:8080")
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.get = MagicMock(
+            return_value=_make_response(200, {"messages": []})
+        )
+        client._session = mock_session
+
+        await client.history(limit=15)
+
+        call_kwargs = mock_session.get.call_args[1]
+        assert call_kwargs["params"]["limit"] == "15"
+
+    @pytest.mark.asyncio
+    async def test_history_raises_on_401(self):
+        client = RemoteClient(url="http://localhost:8080")
+        mock_session = MagicMock()
+        mock_session.closed = False
+
+        resp = AsyncMock()
+        resp.status = 401
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=resp)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        mock_session.get = MagicMock(return_value=ctx)
+        client._session = mock_session
+
+        with pytest.raises(PermissionError, match="Authentication failed"):
+            await client.history()

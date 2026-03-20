@@ -125,12 +125,12 @@ class TestOnEventCallback:
 class TestOnTokenCallback:
     @pytest.mark.asyncio
     async def test_fires_tokens_for_final_text(self):
-        """on_token receives each character of the final response."""
+        """on_token receives word-chunked tokens of the final response."""
         tokens: list[str] = []
         on_token = MagicMock(side_effect=lambda t: tokens.append(t))
 
         mock_client = AsyncMock()
-        mock_client.chat = AsyncMock(return_value=_text_response("abc"))
+        mock_client.chat = AsyncMock(return_value=_text_response("hello world"))
 
         result = await run_tool_loop(
             client=mock_client,
@@ -141,8 +141,8 @@ class TestOnTokenCallback:
             on_token=on_token,
         )
 
-        assert result == "abc"
-        assert tokens == ["a", "b", "c"]
+        assert result == "hello world"
+        assert tokens == ["hello ", "world "]
 
     @pytest.mark.asyncio
     async def test_no_token_callback_is_safe(self):

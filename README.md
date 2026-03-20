@@ -213,9 +213,11 @@ The `--tui` mode renders a polished full-screen interface:
 
 - **Streaming output** -- tokens appear as they arrive from the model, word by word
 - **Message timestamps** -- each user and bot message shows the time in HH:MM AM/PM format
-- **Turn dividers** -- horizontal rules separate conversation turns for readability
+- **Full-width turn dividers** -- Rich Rule horizontal rules spanning the full terminal width separate conversation turns for readability
 - **Tool call panels** -- tool calls render in bordered panels instead of inline dim text
-- **Thinking indicator** -- "Thinking..." is displayed while waiting for the first token
+- **Cat-themed thinking verbs** -- while waiting for the first token, a rotating cat-themed verb is shown (e.g. "Purring...", "Pawing...", "Whisker-twitching...", "Tail-flicking...") instead of a plain "Thinking..." indicator
+- **Conversation history on startup** -- the last 10 messages are loaded from the server when the TUI starts, so the chat continues seamlessly from where you left off
+- **Slash command autocomplete** -- typing `/` in the input bar shows a filtered list of available commands; press Tab or Enter to complete
 - **Status bar** -- bottom bar shows connection status with a colored dot, active model name, message count, and tool call count
 - **Styled input** -- input field has a prompt prefix for visual clarity
 
@@ -242,7 +244,16 @@ webhook:
   secret: "your-secret-here"
 ```
 
-The webhook API exposes `POST /message`, `GET /poll`, `GET /stream` (SSE), and `GET /health`. The `/stream` endpoint delivers messages and tool events in real-time via Server-Sent Events.
+The webhook API exposes `POST /message`, `GET /poll`, `GET /stream` (SSE), `GET /health`, and `GET /history`. The `/stream` endpoint delivers messages and tool events in real-time via Server-Sent Events.
+
+**Fetch conversation history:**
+
+```bash
+curl "http://localhost:8080/history?limit=20" \
+  -H "Authorization: Bearer your-secret-here"
+```
+
+Returns a JSON array of recent messages (newest last). `limit` defaults to 50.
 
 ## Telegram Commands
 

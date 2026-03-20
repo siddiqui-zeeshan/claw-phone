@@ -123,9 +123,9 @@ async def run_tool_loop(
             # No tool calls — if streaming requested, re-do final call via stream
             content = assistant_message.get("content", "")
             if on_token is not None and content:
-                # Emit tokens for the final text
-                for char in content:
-                    on_token(char)
+                # Emit tokens in word-sized chunks
+                for word in content.split(" "):
+                    on_token(word + " ")
             return _maybe_with_usage(content or "")
 
         # Append the assistant message (with tool_calls) to the conversation

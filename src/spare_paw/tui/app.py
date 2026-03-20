@@ -32,12 +32,12 @@ THINKING_VERBS = (
     "Hunting",
     "Pouncing",
     "Grooming",
+    "Kneading",
+    "Stretching",
+    "Sniffing",
+    "Stalking",
     "Conjuring",
-    "Brewing",
-    "Pondering",
-    "Percolating",
     "Crystallizing",
-    "Synthesizing",
     "Calibrating",
 )
 
@@ -116,8 +116,12 @@ class TUIBackend:
     async def send_text(self, text: str) -> None:
         from rich.markdown import Markdown
 
+        if hasattr(self._app, "_hide_thinking"):
+            self._app._hide_thinking()
         self._app.post_message(AppendLog(Markdown(text)))
         self._app.post_message(AppendLog(""))
+        if hasattr(self._app, "_last_role"):
+            self._app._last_role = "assistant"
 
     async def send_file(self, path: str, caption: str = "") -> None:
         msg = f"File: {path}"
@@ -166,7 +170,7 @@ if HAS_TEXTUAL:
         }
         #chat-log {
             height: 1fr;
-            padding: 1 2;
+            padding: 1 0;
             background: $surface;
         }
         #stream-buffer {
@@ -218,6 +222,7 @@ if HAS_TEXTUAL:
             self._backend: TUIBackend | None = None
             self._current_task: asyncio.Task | None = None
             self._msg_count: int = 0
+            self._last_role: str = ""
             self._tool_count: int = 0
             self._pending_tools: list[str] = []
             self._stream_text: str = ""
@@ -242,20 +247,20 @@ if HAS_TEXTUAL:
             yield Static("", id="status-bar")
             yield Footer()
 
-        def _format_user_msg(self, text: str) -> Any:
+        def _format_user_msg(self, _text: str = "", dt: Any | None = None) -> Any:
             from rich.text import Text
 
-            ts = _format_timestamp()
+            ts = _format_timestamp(dt)
             line = Text()
             line.append("You", style="bold green")
             line.append(" " * max(1, 60 - 3 - len(ts)))
             line.append(ts, style="dim")
             return line
 
-        def _format_bot_label(self) -> Any:
+        def _format_bot_label(self, dt: Any | None = None) -> Any:
             from rich.text import Text
 
-            ts = _format_timestamp()
+            ts = _format_timestamp(dt)
             line = Text()
             line.append("spare-paw", style="bold cyan")
             line.append(" " * max(1, 60 - 9 - len(ts)))
@@ -263,8 +268,10 @@ if HAS_TEXTUAL:
             return line
 
         def _write_divider(self) -> None:
+            from rich.rule import Rule
+
             log = self.query_one("#chat-log", RichLog)
-            log.write("[dim]" + "─" * 60 + "[/dim]")
+            log.write(Rule(characters="━", style="bright_black"))
 
         def _show_thinking(self) -> None:
             thinking = self.query_one("#thinking", Static)
@@ -371,6 +378,7 @@ if HAS_TEXTUAL:
                 self.query_one("#chat-log", RichLog).write(
                     "[dim]Connected to remote spare-paw instance[/dim]\n"
                 )
+                await self._load_history_remote()
             else:
                 if self._app_state is not None:
                     self._model = self._app_state.config.get("models.default", "unknown")
@@ -384,6 +392,7 @@ if HAS_TEXTUAL:
 
                     self._app_state.backend = self._backend
                     start_queue_processor(self._app_state, self._backend)
+                    await self._load_history_local()
 
             self._update_status_bar()
             self.query_one("#input", Input).focus()
@@ -401,11 +410,12 @@ if HAS_TEXTUAL:
 
             self._msg_count += 1
 
-            if self._msg_count > 1:
+            if self._last_role == "assistant":
                 self._write_divider()
 
             log_widget.write(self._format_user_msg(text))
             log_widget.write(text)
+            self._last_role = "user"
 
             self._update_status_bar()
 
@@ -479,6 +489,7 @@ if HAS_TEXTUAL:
                         self.post_message(AppendLog(Markdown(event.get("text", ""))))
                         self.post_message(AppendLog(""))
                         self._msg_count += 1
+                        self._last_role = "assistant"
                         self._update_status_bar()
                     elif etype == "tool_call":
                         tool = event.get("tool", "")
@@ -496,6 +507,57 @@ if HAS_TEXTUAL:
                 self._update_status_bar()
             finally:
                 self._current_task = None
+
+        def _render_history(self, messages: list[dict]) -> None:
+            from datetime import datetime as dt
+
+            from rich.markdown import Markdown
+
+            log = self.query_one("#chat-log", RichLog)
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                created_at = msg.get("created_at", "")
+
+                ts_dt = None
+                if created_at:
+                    try:
+                        ts_dt = dt.fromisoformat(created_at)
+                    except (ValueError, TypeError):
+                        pass
+
+                if role == "user" and self._last_role == "assistant":
+                    self._write_divider()
+
+                if role == "user":
+                    log.write(self._format_user_msg(content, ts_dt))
+                    log.write(content)
+                else:
+                    log.write(self._format_bot_label(ts_dt))
+                    log.write(Markdown(content))
+
+                self._msg_count += 1
+                self._last_role = role
+
+            if messages:
+                self._write_divider()
+
+        async def _load_history_remote(self) -> None:
+            try:
+                messages = await self._client.history(limit=10)
+                self._render_history(messages)
+            except Exception:
+                pass
+
+        async def _load_history_local(self) -> None:
+            try:
+                from spare_paw.context import get_or_create_conversation, recent
+
+                conversation_id = await get_or_create_conversation()
+                messages = await recent(conversation_id, limit=10)
+                self._render_history(messages)
+            except Exception:
+                pass
 
         async def _send_local(self, text: str) -> None:
             from spare_paw.backend import IncomingMessage
@@ -522,8 +584,10 @@ if HAS_TEXTUAL:
         def action_new_conversation(self) -> None:
             self._msg_count = 0
             self._tool_count = 0
+            self._last_role = ""
             self._pending_tools = []
             self._flush_tool_calls()
+            self.query_one("#chat-log", RichLog).clear()
             self._update_status_bar()
             if self._client:
                 self._current_task = asyncio.create_task(self._send_remote("/forget"))

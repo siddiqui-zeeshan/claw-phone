@@ -53,8 +53,17 @@ class WebhookBackend:
         expected = f"Bearer {self._secret}"
         return hmac.compare_digest(auth.encode(), expected.encode())
 
+    _MAX_SESSIONS = 50
+
     def _get_session_queue(self, session_id: str) -> asyncio.Queue[dict[str, Any]]:
         if session_id not in self._session_queues:
+            if len(self._session_queues) >= self._MAX_SESSIONS:
+                self._cleanup_stale_sessions()
+            if len(self._session_queues) >= self._MAX_SESSIONS:
+                oldest = min(self._session_last_seen, key=self._session_last_seen.get)  # type: ignore[arg-type]
+                self._session_queues.pop(oldest, None)
+                self._session_last_seen.pop(oldest, None)
+                self._sse_queues.pop(oldest, None)
             self._session_queues[session_id] = asyncio.Queue()
         self._session_last_seen[session_id] = time.monotonic()
         return self._session_queues[session_id]
@@ -264,6 +273,17 @@ class WebhookBackend:
         self._put_session_queue(msg)
         self._broadcast_sse(msg)
 
+    async def _handle_history(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        limit = min(int(request.query.get("limit", "10")), 100)
+
+        from spare_paw.context import get_or_create_conversation, recent
+
+        conversation_id = await get_or_create_conversation()
+        messages = await recent(conversation_id, limit=limit)
+        return web.json_response({"messages": messages})
+
     async def start(self) -> None:
         self._start_time = time.monotonic()
         self._web_app = web.Application()
@@ -272,6 +292,7 @@ class WebhookBackend:
         self._web_app.router.add_get("/stream", self._handle_stream)
         self._web_app.router.add_get("/health", self._handle_health)
         self._web_app.router.add_get("/status", self._handle_status)
+        self._web_app.router.add_get("/history", self._handle_history)
 
         self._runner = web.AppRunner(self._web_app)
         await self._runner.setup()
