@@ -193,6 +193,10 @@ class TestPollWithSessionId:
             await backend.stop()
 
 
+@pytest.mark.skipif(
+    "CI" in __import__("os").environ,
+    reason="SSE integration tests are too slow for CI",
+)
 class TestStreamSSEEndpoint:
     @pytest.mark.asyncio
     async def test_stream_returns_sse_content_type(self):

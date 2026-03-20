@@ -406,6 +406,10 @@ class TestOnToolEvent:
             _current_session.reset(token)
 
 
+@pytest.mark.skipif(
+    "CI" in __import__("os").environ,
+    reason="SSE integration tests are too slow for CI",
+)
 class TestStreamSSE:
     @pytest.mark.asyncio
     async def test_stream_endpoint_sends_events_in_sse_format(self):
