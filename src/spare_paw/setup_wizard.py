@@ -7,19 +7,28 @@ No API validation in v1 — just writes the config and trusts the user.
 from __future__ import annotations
 
 import asyncio
-import sys
+from importlib import resources
 from pathlib import Path
+
+from spare_paw.platform import default_allowed_paths, detect_platform, platform_label
 
 CLAW_DIR = Path.home() / ".spare-paw"
 CONFIG_PATH = CLAW_DIR / "config.yaml"
 
-CONFIG_TEMPLATE = """\
+
+def _config_template(platform: str) -> str:
+    """Return the config YAML template with platform-aware defaults."""
+    label = platform_label()
+    paths = default_allowed_paths()
+    allowed_paths = "\n".join(f'      - "{p}"' for p in paths)
+
+    return f"""\
 telegram:
-  bot_token: "{bot_token}"
-  owner_id: {owner_id}
+  bot_token: "{{bot_token}}"
+  owner_id: {{owner_id}}
 
 openrouter:
-  api_key: "{openrouter_key}"
+  api_key: "{{openrouter_key}}"
 
 models:
   default: "google/gemini-2.0-flash"
@@ -27,10 +36,10 @@ models:
   cron_default: "google/gemini-2.0-flash"
 
 tavily:
-  api_key: "{tavily_key}"
+  api_key: "{{tavily_key}}"
 
 groq:
-  api_key: "{groq_key}"
+  api_key: "{{groq_key}}"
 
 context:
   max_messages: 64
@@ -59,12 +68,12 @@ tools:
 agent:
   max_tool_iterations: 20
   system_prompt: |
-    You are a personal AI assistant running 24/7 on an Android phone.
+    You are a personal AI assistant running 24/7.
     You have access to the local filesystem, shell, web search, and web scraping.
     You can manage scheduled tasks (crons) for the user.
-    Be concise. The user is on Telegram, likely on mobile.
-    Current time: {{current_time}}
-    Device: Android (Termux)
+    Be concise.
+    Current time: {{{{current_time}}}}
+    Device: {label}
 
 logging:
   level: "INFO"
@@ -73,31 +82,42 @@ logging:
 """
 
 
-def _detect_platform() -> str:
-    """Detect the current platform: 'termux', 'mac', or 'linux'."""
-    import os
-    # Check for Termux
-    if os.path.exists("/data/data/com.termux"):
-        return "termux"
-    if sys.platform == "darwin":
-        return "mac"
-    return "linux"
+def _defaults_dir() -> Path:
+    """Locate the defaults directory — works both from repo and installed package."""
+    # Try package data first (works when installed via pip)
+    try:
+        return Path(str(resources.files("spare_paw") / "defaults"))
+    except (TypeError, FileNotFoundError):
+        pass
+    # Fallback: repo root (development mode)
+    repo_defaults = Path(__file__).resolve().parent.parent.parent / "defaults"
+    if repo_defaults.is_dir():
+        return repo_defaults
+    return Path(__file__).resolve().parent / "defaults"
 
 
 def _copy_defaults() -> None:
-    """Copy default prompt files, selecting SYSTEM.md based on platform."""
-    defaults_dir = Path(__file__).resolve().parent.parent.parent / "defaults"
-    platform = _detect_platform()
+    """Copy default prompt files, selecting IDENTITY.md and SYSTEM.md based on platform."""
+    defaults_dir = _defaults_dir()
+    platform = detect_platform()
     print(f"  Detected platform: {platform}")
 
-    for filename in ("IDENTITY.md", "USER.md"):
-        target = CLAW_DIR / filename
-        if target.exists():
-            continue
-        source = defaults_dir / filename
+    # IDENTITY.md — pick platform-specific version
+    target = CLAW_DIR / "IDENTITY.md"
+    if not target.exists():
+        identity_file = "IDENTITY.termux.md" if platform == "termux" else "IDENTITY.md"
+        source = defaults_dir / identity_file
         if source.exists():
             target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
-            print(f"  Created {target}")
+            print(f"  Created {target} (from {identity_file})")
+
+    # USER.md
+    user_target = CLAW_DIR / "USER.md"
+    if not user_target.exists():
+        source = defaults_dir / "USER.md"
+        if source.exists():
+            user_target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            print(f"  Created {user_target}")
 
     # SYSTEM.md — pick platform-specific version
     target = CLAW_DIR / "SYSTEM.md"
@@ -185,20 +205,15 @@ def run() -> None:
     groq_key = _prompt_optional("Groq API key (for voice messages)")
 
     # 4. Write config
-    platform = _detect_platform()
-    allowed_paths = {
-        "termux": '      - "/sdcard"\n      - "/data/data/com.termux/files/home"',
-        "mac": f'      - "{Path.home()}"',
-        "linux": f'      - "{Path.home()}"',
-    }.get(platform, f'      - "{Path.home()}"')
+    platform = detect_platform()
+    template = _config_template(platform)
 
-    config_content = CONFIG_TEMPLATE.format(
+    config_content = template.format(
         bot_token=bot_token,
         owner_id=owner_id,
         openrouter_key=openrouter_key,
         tavily_key=tavily_key,
         groq_key=groq_key,
-        allowed_paths=allowed_paths,
     )
     CONFIG_PATH.write_text(config_content, encoding="utf-8")
     # Restrict permissions — config contains secrets
@@ -224,6 +239,7 @@ def _init_database() -> None:
 
 def _print_success() -> None:
     """Print success message and next steps."""
+    platform = detect_platform()
     print()
     print("=" * 52)
     print("    Setup complete!")
@@ -231,9 +247,10 @@ def _print_success() -> None:
     print()
     print("To start spare-paw:")
     print()
-    print("  python -m spare_paw gateway")
+    print("  spare-paw gateway")
     print()
-    print("Or with the watchdog (recommended for Termux):")
-    print()
-    print("  bash scripts/watchdog.sh")
-    print()
+    if platform == "termux":
+        print("Or with the watchdog (recommended for Termux):")
+        print()
+        print("  bash scripts/watchdog.sh")
+        print()

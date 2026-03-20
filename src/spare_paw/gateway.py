@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import sys
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -226,7 +227,7 @@ async def _async_main() -> None:
 
     tool_registry.register(
         name="send_file",
-        description="Send a file (photo, video, audio, document) to the user via Telegram.",
+        description="Send a file (photo, video, audio, document) to the user.",
         parameters_schema={
             "type": "object",
             "properties": {
@@ -250,7 +251,7 @@ async def _async_main() -> None:
     tool_registry.register(
         name="send_message",
         description=(
-            "Send a message to the user via Telegram. Use this inside cron jobs and "
+            "Send a message to the user. Use this inside cron jobs and "
             "background agents to deliver results. In normal conversation, prefer "
             "replying directly instead of calling this tool."
         ),
@@ -280,29 +281,43 @@ async def _async_main() -> None:
 
     logger.info("Tool registry initialized with %d tools", len(tool_registry))
 
-    # 10. Build Telegram application and backend
-    bot_token = config.get("telegram.bot_token")
-    if not bot_token:
-        logger.error("No telegram.bot_token in config. Run 'python -m spare_paw setup' first.")
-        return
+    # 10. Build backend (Telegram or webhook)
+    backend_type = config.get("backend", "telegram")
+    start_queue_processor = None
 
-    owner_id = config.get("telegram.owner_id")
+    if backend_type == "webhook":
+        from spare_paw.webhook.backend import WebhookBackend
 
-    from spare_paw.bot.backend import TelegramBackend
+        backend = WebhookBackend(
+            port=config.get("webhook.port", 8080),
+            secret=config.get("webhook.secret", ""),
+            app_state=app_state,
+        )
+        app_state.backend = backend
+        logger.info("Using webhook backend on port %s", config.get("webhook.port", 8080))
+    else:
+        bot_token = config.get("telegram.bot_token")
+        if not bot_token:
+            logger.error("No telegram.bot_token in config. Run 'python -m spare_paw setup' first.")
+            return
 
-    backend = TelegramBackend.create(bot_token, owner_id)
-    app_state.backend = backend
-    backend.set_app_state(app_state)
+        owner_id = config.get("telegram.owner_id")
 
-    # 11. Register handlers
-    try:
-        from spare_paw.bot.handler import setup_handlers, start_queue_processor
+        from spare_paw.bot.backend import TelegramBackend
 
-        setup_handlers(backend._application)
-        logger.info("Bot handlers registered")
-    except ImportError:
-        start_queue_processor = None
-        logger.warning("bot.handler not yet implemented; skipping handler registration")
+        backend = TelegramBackend.create(bot_token, owner_id)
+        app_state.backend = backend
+        backend.set_app_state(app_state)
+
+        # Register Telegram handlers
+        try:
+            from spare_paw.bot.handler import setup_handlers, start_queue_processor
+
+            setup_handlers(backend._application)
+            logger.info("Bot handlers registered")
+        except ImportError:
+            start_queue_processor = None
+            logger.warning("bot.handler not yet implemented; skipping handler registration")
 
     # 12. Init cron scheduler
     try:
@@ -326,8 +341,12 @@ async def _async_main() -> None:
         shutdown_event.set()
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _signal_handler, sig)
+    if sys.platform != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _signal_handler, sig)
+    else:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda s, _f: _signal_handler(s))
 
     # 15. Start the bot via backend
     await backend.start()
@@ -336,7 +355,7 @@ async def _async_main() -> None:
     if start_queue_processor is not None:
         start_queue_processor(backend._application)
 
-    logger.info("Telegram bot started polling")
+    logger.info("Bot started (%s backend)", backend_type)
 
     # Wait until shutdown signal
     await shutdown_event.wait()
