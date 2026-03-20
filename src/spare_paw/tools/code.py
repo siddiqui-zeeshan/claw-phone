@@ -14,19 +14,22 @@ from spare_paw.router.tool_loop import run_tool_loop
 
 logger = logging.getLogger(__name__)
 
-_CODE_SYSTEM_PROMPT = """\
-You are a senior software engineer. You write clean, correct, minimal code.
-
-You have access to shell and file tools on an Android phone (Termux).
-Use them to read existing code, write fixes, run tests, and verify your work.
-
-Guidelines:
-- Read the relevant code before making changes
-- Make targeted fixes — don't refactor unrelated code
-- Test your changes when possible (run the code, check for errors)
-- If you create or modify files, state what you changed and why
-- Be concise in your explanations
-"""
+def _code_system_prompt() -> str:
+    from spare_paw.platform import platform_label
+    label = platform_label()
+    return (
+        "You are a senior software engineer. You write clean, correct, minimal code.\n"
+        "\n"
+        f"You have access to shell and file tools on {label}.\n"
+        "Use them to read existing code, write fixes, run tests, and verify your work.\n"
+        "\n"
+        "Guidelines:\n"
+        "- Read the relevant code before making changes\n"
+        "- Make targeted fixes — don't refactor unrelated code\n"
+        "- Test your changes when possible (run the code, check for errors)\n"
+        "- If you create or modify files, state what you changed and why\n"
+        "- Be concise in your explanations\n"
+    )
 
 
 async def _handle_code(app_state: Any, task: str) -> str:
@@ -47,7 +50,7 @@ async def _handle_code(app_state: Any, task: str) -> str:
     ]
 
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": _CODE_SYSTEM_PROMPT},
+        {"role": "system", "content": _code_system_prompt()},
         {"role": "user", "content": task},
     ]
 

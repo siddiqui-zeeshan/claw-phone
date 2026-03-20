@@ -8,7 +8,7 @@ Usage: python -m spare_paw <command>
 
 Commands:
   setup     Run the interactive setup wizard
-  gateway   Start the Telegram bot + scheduler (main loop)
+  gateway   Start the bot + scheduler (main loop)
 """
 
 

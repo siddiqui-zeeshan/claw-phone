@@ -37,12 +37,9 @@ PARAMETERS_SCHEMA: dict[str, Any] = {
     "required": ["command"],
 }
 
-DESCRIPTION = (
-    "Execute a shell command on the Android phone (Termux). "
-    "Use termux-api commands for device interactions: termux-battery-status, "
-    "termux-location, termux-camera-photo, termux-notification, termux-tts-speak, "
-    "termux-sensor, etc. Use 'su -c' for root commands."
-)
+def _get_description() -> str:
+    from spare_paw.platform import default_shell_description
+    return default_shell_description()
 
 # -- Handler ---------------------------------------------------------------
 
@@ -113,7 +110,7 @@ def register(registry: ToolRegistry, config: dict[str, Any]) -> None:
     # pickled for ProcessPoolExecutor.
     registry.register(
         name="shell",
-        description=DESCRIPTION,
+        description=_get_description(),
         parameters_schema=PARAMETERS_SCHEMA,
         handler=execute_shell,
         run_in_executor=True,
