@@ -19,6 +19,7 @@ try:
     HAS_TEXTUAL = True
 except ImportError:
     HAS_TEXTUAL = False
+    Message = object  # type: ignore[assignment,misc]
 
 _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp"})
 
