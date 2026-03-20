@@ -56,8 +56,10 @@ def _execute_custom_tool(
     )
 
     try:
+        from spare_paw.platform import default_shell_executable
+
         proc = subprocess.run(
-            ["bash", script_path],
+            [*default_shell_executable(), script_path],
             capture_output=True,
             text=True,
             timeout=timeout,

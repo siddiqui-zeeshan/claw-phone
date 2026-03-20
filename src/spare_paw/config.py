@@ -12,58 +12,67 @@ from typing import Any
 
 import yaml
 
+from spare_paw.platform import default_allowed_paths, platform_label
+
 CONFIG_DIR = Path.home() / ".spare-paw"
 CONFIG_PATH = CONFIG_DIR / "config.yaml"
 
-DEFAULTS: dict[str, Any] = {
-    "context": {
-        "max_messages": 64,
-        "token_budget": 120000,
-        "safety_margin": 0.85,
-    },
-    "agent": {
-        "max_tool_iterations": 20,
-        "system_prompt": (
-            "You are a personal AI assistant running 24/7 on an Android phone.\n"
-            "You have access to the local filesystem, shell, web search, and web scraping.\n"
-            "You can manage scheduled tasks (crons) for the user.\n"
-            "Be concise. The user is on Telegram, likely on mobile.\n"
-            "Current time: {current_time}\n"
-            "Device: Android (Termux)"
-        ),
-    },
-    "tools": {
-        "shell": {
-            "enabled": True,
-            "timeout_seconds": 30,
-            "max_output_chars": 10000,
+
+def _build_defaults() -> dict[str, Any]:
+    """Build DEFAULTS with platform-aware values resolved at import time."""
+    label = platform_label()
+    return {
+        "context": {
+            "max_messages": 64,
+            "token_budget": 120000,
+            "safety_margin": 0.85,
         },
-        "files": {
-            "enabled": True,
-            "allowed_paths": ["/sdcard", "/data/data/com.termux/files/home"],
+        "agent": {
+            "max_tool_iterations": 20,
+            "system_prompt": (
+                "You are a personal AI assistant running 24/7.\n"
+                "You have access to the local filesystem, shell, web search, and web scraping.\n"
+                "You can manage scheduled tasks (crons) for the user.\n"
+                "Be concise.\n"
+                "Current time: {current_time}\n"
+                f"Device: {label}"
+            ),
         },
-        "web_search": {
-            "enabled": True,
-            "max_results": 5,
+        "tools": {
+            "shell": {
+                "enabled": True,
+                "timeout_seconds": 30,
+                "max_output_chars": 10000,
+            },
+            "files": {
+                "enabled": True,
+                "allowed_paths": default_allowed_paths(),
+            },
+            "web_search": {
+                "enabled": True,
+                "max_results": 5,
+            },
+            "web_scrape": {
+                "enabled": True,
+                "timeout_seconds": 15,
+                "max_content_chars": 20000,
+            },
+            "cron": {
+                "enabled": True,
+            },
         },
-        "web_scrape": {
-            "enabled": True,
-            "timeout_seconds": 15,
-            "max_content_chars": 20000,
+        "logging": {
+            "level": "INFO",
+            "max_bytes": 10485760,
+            "backup_count": 3,
         },
-        "cron": {
-            "enabled": True,
+        "mcp": {
+            "servers": [],
         },
-    },
-    "logging": {
-        "level": "INFO",
-        "max_bytes": 10485760,
-        "backup_count": 3,
-    },
-    "mcp": {
-        "servers": [],
-    },
-}
+    }
+
+
+DEFAULTS: dict[str, Any] = _build_defaults()
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spare-paw"
 version = "0.1.0"
-description = "24/7 personal AI agent on Android via Termux + Telegram"
+description = "Personal AI agent accessible via Telegram"
 requires-python = ">=3.11"
 dependencies = [
     "python-telegram-bot>=21.0",
@@ -18,8 +18,14 @@ dependencies = [
     "mcp>=1.26.0",
 ]
 
+[project.scripts]
+spare-paw = "spare_paw.__main__:main"
+
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+spare_paw = ["defaults/*.md"]

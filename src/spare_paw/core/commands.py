@@ -8,7 +8,7 @@ and sends the returned string.
 from __future__ import annotations
 
 import logging
-import os
+import platform as platform_mod
 import resource
 from datetime import datetime, timezone
 from typing import Any
@@ -27,7 +27,7 @@ async def cmd_status(app_state: Any) -> str:
 
     usage = resource.getrusage(resource.RUSAGE_SELF)
     rss_kb = usage.ru_maxrss
-    if os.uname().sysname == "Darwin":
+    if platform_mod.system() == "Darwin":
         rss_kb = rss_kb // 1024
     rss_mb = rss_kb / 1024
 

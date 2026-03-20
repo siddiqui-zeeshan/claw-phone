@@ -1,6 +1,6 @@
 # spare-paw
 
-A 24/7 personal AI agent running on a rooted Android phone via Termux, accessible through Telegram. Features multi-model routing via OpenRouter, DAG-based lossless context management, shell and filesystem tools, scheduled tasks, voice transcription, and full-text search over conversation history. Cold starts in ~1 second.
+A 24/7 personal AI agent accessible through Telegram. Runs on macOS, Linux, Windows, Android (Termux), or Docker. Features multi-model routing via OpenRouter, DAG-based lossless context management, shell and filesystem tools, scheduled tasks, voice transcription, and full-text search over conversation history. Cold starts in ~1 second.
 
 ## Features
 
@@ -21,18 +21,34 @@ A 24/7 personal AI agent running on a rooted Android phone via Termux, accessibl
 - **Token/cost tracking** -- per-agent token usage tracking (prompt, completion, total) from OpenRouter, visible via `list_agents`
 - **MCP client** -- connect to external MCP servers (GitHub, filesystem, etc.) and use their tools alongside native tools
 - **Owner-only auth** -- all messages from non-owner Telegram users are silently ignored
+- **Platform-aware defaults** -- auto-detects macOS, Linux, Windows, and Termux at startup; sets appropriate shell descriptions, allowed paths, and prompt files
 
 ## Prerequisites
 
 - Python 3.11+
-- Termux (on Android)
-- Rooted Android recommended (8GB+ RAM, 128GB+ storage, always-on Wi-Fi)
 - API keys: OpenRouter (required), Telegram Bot Token (required), Tavily (optional, for web search), Groq (optional, for voice)
 - Node.js (optional, for MCP servers that use `npx`)
 
 ## Quick Start
 
-### Termux installation
+### Install
+
+```bash
+git clone <repo-url>
+cd spare-paw
+pip install .
+```
+
+After installation, the `spare-paw` CLI entry point is available:
+
+```bash
+spare-paw setup    # interactive setup wizard
+spare-paw gateway  # start the bot
+```
+
+You can also invoke via `python -m spare_paw setup` / `python -m spare_paw gateway` without installing.
+
+### Termux (Android)
 
 ```bash
 pkg update && pkg upgrade
@@ -43,25 +59,39 @@ cd spare-paw
 pip install --break-system-packages -e .
 ```
 
-### Setup
+Use `termux-wake-lock` before starting to prevent Android from killing the process.
 
-Run the interactive setup wizard to create `~/.spare-paw/config.yaml`, validate API keys, and initialize the database:
+### Docker
 
 ```bash
-python -m spare_paw setup
+docker build -t spare-paw .
+docker run -d \
+  -v ~/.spare-paw:/root/.spare-paw \
+  -p 8080:8080 \
+  spare-paw
 ```
+
+The container mounts `~/.spare-paw` for persistent config, database, and logs. Port 8080 is used when running the webhook backend.
+
+### Setup
+
+Run the interactive setup wizard to create `~/.spare-paw/config.yaml`, initialize the database, and copy platform-appropriate prompt files:
+
+```bash
+spare-paw setup
+```
+
+The wizard detects your platform (Termux, macOS, Linux, or Windows) and writes platform-appropriate defaults — allowed file paths, shell tool description, and `SYSTEM.md` — into `~/.spare-paw/`.
 
 ### Running
 
 ```bash
 # Start the gateway
-python -m spare_paw gateway
+spare-paw gateway
 
-# With watchdog (recommended for always-on operation)
+# With watchdog (recommended for always-on operation on Termux)
 bash scripts/watchdog.sh
 ```
-
-Use `termux-wake-lock` before starting to prevent Android from killing the process.
 
 ## Configuration
 
@@ -71,7 +101,9 @@ A template is provided at `config.example.yaml`. Key sections:
 
 | Section | Purpose |
 |---------|---------|
+| `backend` | `"telegram"` (default) or `"webhook"` |
 | `telegram` | Bot token and owner ID |
+| `webhook` | Port and optional secret for the HTTP webhook backend |
 | `openrouter` | OpenRouter API key |
 | `models` | Model slots: `default`, `smart`, `cron_default` |
 | `groq` | Groq API key for voice transcription |
@@ -101,6 +133,35 @@ context:
   summary_model: "google/gemini-3.1-flash-lite"
 ```
 
+### Webhook backend
+
+Set `backend: "webhook"` to replace Telegram with a plain HTTP server. Useful for Docker deployments, CI testing, or custom integrations:
+
+```yaml
+backend: "webhook"
+webhook:
+  port: 8080
+  secret: "your-secret-here"   # optional; sent as Bearer token
+```
+
+**Send a message:**
+
+```bash
+curl -X POST http://localhost:8080/message \
+  -H "Authorization: Bearer your-secret-here" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "hello"}'
+```
+
+**Poll for responses:**
+
+```bash
+curl "http://localhost:8080/poll?timeout=30" \
+  -H "Authorization: Bearer your-secret-here"
+```
+
+The poll endpoint returns a JSON array of response messages and supports images and voice (base64-encoded in the request body).
+
 ## Telegram Commands
 
 | Command | Description |
@@ -125,8 +186,8 @@ All tools are exposed to the LLM as callable functions. Blocking tools run in a 
 
 | Tool | Description | Notes |
 |------|-------------|-------|
-| `shell` | Execute shell commands in Termux | Configurable timeout (default 30s), output truncated at 10K chars |
-| `files` | Read, write, append, list, delete files | Restricted to `allowed_paths` in config |
+| `shell` | Execute shell commands | Platform-aware description; configurable timeout (default 30s), output truncated at 10K chars |
+| `files` | Read, write, append, list, delete files | Restricted to `allowed_paths` in config; defaults set per platform |
 | `tavily_search` | Web search via Tavily API | Optional; requires Tavily API key |
 | `web_scrape` | Fetch and extract content from a URL | BeautifulSoup parsing, 15s timeout, 20K char limit |
 | `cron_create` | Create a scheduled task | Accepts name, cron expression, prompt, optional model |
@@ -165,7 +226,7 @@ The bot can interact with GitHub autonomously using the `gh` CLI through its exi
 
 ### Setup
 
-1. Install `gh` CLI on Termux: `pkg install gh`
+1. Install `gh` CLI (`pkg install gh` on Termux, `brew install gh` on macOS, or via the [official installer](https://cli.github.com/) on other platforms)
 2. Create a fine-grained PAT on GitHub with the scopes you need (repo contents, issues, PRs)
 3. Authenticate: `echo "<token>" | gh auth login --with-token`
 4. Wire up git credentials: `gh auth setup-git`
@@ -238,8 +299,9 @@ After 100+ messages in a conversation, the bot had compressed history into 12 DA
 ```
 MessageBackend (protocol)
   |
-  +-- TelegramBackend (bot/backend.py)    <-- current implementation
-  |     python-telegram-bot, owner auth, photo/voice handling
+  +-- TelegramBackend (bot/backend.py)     -- Telegram bot, owner auth, photo/voice handling
+  |
+  +-- WebhookBackend (webhook/backend.py)  -- HTTP server (POST /message, GET /poll, GET /health)
   |
   v
 Core Engine (core/engine.py)
@@ -265,14 +327,14 @@ Agent Orchestrator (spawn_agent -> parallel multi-agent spawning)
 Cron Scheduler (APScheduler, SQLite-persisted, semaphore-gated)
 ```
 
-The core engine is decoupled from Telegram via the `MessageBackend` protocol (`backend.py`). `TelegramBackend` in `bot/backend.py` is the current implementation; additional backends (webhook, Discord, etc.) can be added by implementing `MessageBackend` and `IncomingMessage`. `gateway.py` interacts with the backend through `AppState.backend` rather than directly with the Telegram `Application`.
+The core engine is decoupled from any specific frontend via the `MessageBackend` protocol (`backend.py`). `TelegramBackend` in `bot/backend.py` and `WebhookBackend` in `webhook/backend.py` are the two current implementations. Additional backends (Discord, Slack, etc.) can be added by implementing `MessageBackend` and `IncomingMessage`. `gateway.py` interacts with the backend through `AppState.backend` rather than directly with any platform SDK.
 
 Key design points:
 
 - Single async event loop with a ProcessPoolExecutor (4 workers) for blocking operations
 - `asyncio.Semaphore(1)` serializes all model API calls to prevent races
 - Heartbeat file touched every 30s; watchdog restarts if stale beyond 90s
-- Cron outputs are delivered to Telegram but do not enter conversation memory
+- Cron outputs are delivered to the active backend but do not enter conversation memory
 - Subagents don't message the user directly; results flow back through a group callback queue, letting the main LLM synthesize a unified response. Results are stored in conversation memory for follow-up questions
 - Multiple agents spawned in one tool-call batch are deterministically grouped by the tool loop (shared batch group_id); the turn stop is deferred until all spawns in the batch complete
 - Safety limits: max 3 concurrent agents, max 3 per group
@@ -280,6 +342,7 @@ Key design points:
 - Each agent tracks token usage (prompt, completion, total) from OpenRouter API responses
 - Token counting uses tiktoken with a configurable safety margin for non-OpenAI models
 - DAG compaction runs automatically after each turn: messages beyond the fresh tail are chunked into leaf summaries, and when enough leaves accumulate they condense into higher-level nodes. Schema v3 adds a `summary_nodes` table with FTS5 index. `assemble()` injects compressed history between the system prompt and fresh messages
+- Platform detection at startup (`platform.py`) sets shell tool description, default allowed paths, and selects the correct `SYSTEM.md` template for Termux, macOS, Linux, and Windows
 
 See [SPEC.md](SPEC.md) for the full specification including database schema, concurrency model, and design decisions.
 
@@ -301,13 +364,14 @@ pytest
 
 ```
 src/spare_paw/
-  __main__.py        # Entry point: setup / gateway
+  __main__.py        # Entry point: spare-paw setup / spare-paw gateway
   backend.py         # MessageBackend protocol + IncomingMessage dataclass
   config.py          # Config loading
   db.py              # SQLite connection, schema, migrations
   context.py         # Sliding window context + FTS5 search
   gateway.py         # Main async loop (uses AppState.backend)
-  setup_wizard.py    # Interactive onboarding
+  platform.py        # Platform detection and platform-appropriate defaults
+  setup_wizard.py    # Interactive onboarding (platform-aware)
   core/
     engine.py        # Message processing and tool loop (backend-agnostic)
     prompt.py        # System prompt builder
@@ -318,6 +382,8 @@ src/spare_paw/
     handler.py       # Telegram update handler with queue
     commands.py      # Telegram command wiring
     voice.py         # Voice message handling
+  webhook/
+    backend.py       # WebhookBackend: HTTP server implementing MessageBackend
   router/
     openrouter.py    # OpenRouter API client
     tool_loop.py     # Tool-use execution loop
@@ -335,6 +401,13 @@ src/spare_paw/
   mcp/
     client.py        # MCP client: connects to external MCP servers
     schema.py        # MCP schema conversion utilities
+defaults/
+  IDENTITY.md        # Default bot personality (generic)
+  IDENTITY.termux.md # Bot personality variant for Termux/Android
+  SYSTEM.md          # Default SYSTEM.md (Termux)
+  SYSTEM.mac.md      # macOS system context
+  SYSTEM.linux.md    # Linux system context
+  USER.md            # User preferences template
 ```
 
 ## Known Issues
