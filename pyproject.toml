@@ -22,6 +22,7 @@ dependencies = [
 spare-paw = "spare_paw.__main__:main"
 
 [project.optional-dependencies]
+tui = ["rich>=13.0", "textual>=1.0"]
 dev = ["pytest", "pytest-asyncio"]
 
 [tool.setuptools.packages.find]
