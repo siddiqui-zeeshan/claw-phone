@@ -61,22 +61,6 @@ def setup_handlers(application: "Application") -> None:
 # Queue management
 # ---------------------------------------------------------------------------
 
-def start_queue_processor(application: "Application") -> None:
-    """Start the background queue processor via core/engine.
-
-    Delegates to engine.start_queue_processor which owns the queue.
-    """
-    from spare_paw.core.engine import start_queue_processor as _engine_start
-
-    app_state = application.bot_data.get("app_state")
-    backend = getattr(app_state, "backend", None) if app_state else None
-
-    if app_state and backend:
-        _engine_start(app_state, backend)
-    else:
-        logger.warning("Cannot start queue processor: app_state or backend not available")
-
-
 async def _queue_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Build IncomingMessage from Telegram Update and enqueue for processing."""
     app_state = context.bot_data.get("app_state")

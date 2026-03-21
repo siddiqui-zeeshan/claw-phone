@@ -112,6 +112,47 @@ async def test_assemble_respects_token_budget(_init_db, monkeypatch):
     config_mod.config.set_override("context.safety_margin", 0.85)
 
 
+@pytest.mark.asyncio
+async def test_assemble_caps_summary_tokens(_init_db, monkeypatch):
+    """Summaries exceeding the budget are dropped (oldest first)."""
+    from spare_paw import config as config_mod
+    from spare_paw.context import count_tokens
+
+    conv_id = await new_conversation()
+    await ingest(conv_id, "user", "Hello")
+
+    db = _init_db
+    # Ensure summary_nodes table exists (it's in SCHEMA_V3)
+    await db.executescript(db_mod.SCHEMA_V3)
+    await db.commit()
+    # Insert 10 summary nodes, each ~500 tokens worth of text
+    for i in range(10):
+        content = f"Summary {i}: " + ("word " * 500)  # ~500 tokens each
+        await db.execute(
+            """INSERT INTO summary_nodes
+               (id, conversation_id, parent_id, depth, content, token_count, source_msg_ids, created_at)
+               VALUES (?, ?, NULL, 0, ?, ?, '[]', datetime('now', ?))""",
+            (f"node-{i}", conv_id, content, count_tokens(content), f"+{i} minutes"),
+        )
+    await db.commit()
+
+    # Set summary budget to 2000 tokens — should fit ~4 of 10 summaries
+    config_mod.config.set_override("context.summary_token_budget", 2000)
+
+    messages = await assemble(conv_id, "sys")
+
+    # Count compressed history messages
+    summaries = [m for m in messages if "[Compressed History]" in m.get("content", "")]
+    assert len(summaries) < 10, f"Expected fewer than 10 summaries, got {len(summaries)}"
+    assert len(summaries) > 0, "Expected at least some summaries"
+
+    # The surviving summaries should be the NEWEST ones
+    last_summary = summaries[-1]["content"]
+    assert "Summary 9" in last_summary, "Newest summary should be included"
+
+    config_mod.config.set_override("context.summary_token_budget", 5000)
+
+
 # ---------------------------------------------------------------------------
 # search (FTS5)
 # ---------------------------------------------------------------------------

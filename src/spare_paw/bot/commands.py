@@ -358,7 +358,7 @@ async def _roles_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not _is_owner(update, app_state):
         return
 
-    result = await cmd_roles()
+    result = await cmd_roles(app_state)
     await update.message.reply_text(result)
 
 

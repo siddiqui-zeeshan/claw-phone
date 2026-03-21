@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from spare_paw import context as ctx_module
-from spare_paw.config import MODEL_ROLES
+from spare_paw.config import MODEL_ROLES, resolve_model
 from spare_paw.db import DB_PATH, get_db
 
 logger = logging.getLogger(__name__)
@@ -88,9 +88,12 @@ async def cmd_search(app_state: Any, query: str) -> str:
     return text
 
 
-async def cmd_roles() -> str:
-    """List available model roles."""
-    lines = [f"  {role}" for role in MODEL_ROLES]
+async def cmd_roles(app_state: Any) -> str:
+    """List available model roles with their assigned models."""
+    lines: list[str] = []
+    for role in MODEL_ROLES:
+        model = resolve_model(app_state.config, role)
+        lines.append(f"  {role} → {model}")
     return (
         "Available roles:\n" + "\n".join(lines)
         + "\n\nUsage: /model <role> <model_id>"

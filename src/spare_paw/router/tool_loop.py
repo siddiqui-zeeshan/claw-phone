@@ -32,8 +32,8 @@ DEFAULT_TOOL_LIMITS: dict[str, int] = {
     "web_scrape": 5,
     "web_search": 5,
     "tavily_search": 5,
-    "shell": 10,
-    "spawn_agent": 3,
+    "shell": 20,
+    "spawn_agent": 5,
 }
 
 

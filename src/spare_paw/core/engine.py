@@ -238,6 +238,8 @@ async def enqueue(item: IncomingMessage | tuple) -> None:
     """Put a message or agent callback on the processing queue."""
     if _message_queue is not None:
         await _message_queue.put(item)
+    else:
+        logger.error("enqueue() called but queue not initialized — item DROPPED: %s", type(item))
 
 
 def start_queue_processor(app_state: Any, backend: MessageBackend) -> None:
@@ -246,9 +248,10 @@ def start_queue_processor(app_state: Any, backend: MessageBackend) -> None:
     _message_queue = asyncio.Queue()
     _queue_task = asyncio.create_task(_process_queue(app_state, backend))
 
-    # Share the queue with the subagent module for callbacks
+    # Share the queue with the subagent module for callbacks and start watchdog
     from spare_paw.tools import subagent as subagent_mod
     subagent_mod._message_queue = _message_queue
+    subagent_mod.start_watchdog()
 
     logger.info("Message queue processor started")
 
