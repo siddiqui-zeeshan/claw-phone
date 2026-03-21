@@ -24,12 +24,22 @@ _agents: dict[str, dict[str, Any]] = {}
 _MAX_CONCURRENT = 3
 _MAX_PER_GROUP = 3  # max agents in a single group/batch
 
-# Reference to the message queue — set by handler.py at startup
+# Reference to the message queue — set by engine.py at startup
 _message_queue: asyncio.Queue | None = None
+
+# Reference to app_state — set during register()
+_app_state: Any | None = None
+
+# Watchdog settings
+_WATCHDOG_INTERVAL = 30  # seconds between scans
+_WATCHDOG_TIMEOUT = 180  # cancel after 3 minutes of inactivity
+_watchdog_task: asyncio.Task | None = None
 
 # ---------------------------------------------------------------------------
 # Agent types / archetypes
 # ---------------------------------------------------------------------------
+
+_DEFAULT_AGENT_LIMITS: dict[str, int] = {"shell": 15, "web_search": 5}
 
 AGENT_TYPES: dict[str, dict[str, Any]] = {
     "researcher": {
@@ -38,6 +48,7 @@ AGENT_TYPES: dict[str, dict[str, Any]] = {
             "and cite URLs when possible. Focus on finding accurate, up-to-date information."
         ),
         "tools": ["tavily_search", "web_scrape", "shell", "files"],
+        "tool_limits": {"web_search": 10, "tavily_search": 10, "shell": 10},
     },
     "coder": {
         "system_suffix": (
@@ -45,6 +56,7 @@ AGENT_TYPES: dict[str, dict[str, Any]] = {
             "Use the shell to run commands and verify your work."
         ),
         "tools": ["shell", "files", "code"],
+        "tool_limits": {"shell": 30, "web_search": 3},
     },
     "analyst": {
         "system_suffix": (
@@ -52,6 +64,7 @@ AGENT_TYPES: dict[str, dict[str, Any]] = {
             "and extract key insights. Be thorough but concise."
         ),
         "tools": ["files", "shell", "tavily_search"],
+        "tool_limits": {"shell": 15, "web_search": 5, "tavily_search": 5},
     },
 }
 
@@ -65,7 +78,7 @@ def _check_group_complete(group_id: str) -> bool:
     group = [a for a in _agents.values() if a.get("group_id") == group_id]
     if not group:
         return False
-    return all(a["status"] in ("completed", "failed") for a in group)
+    return all(a["status"] in ("completed", "failed", "timed_out") for a in group)
 
 
 async def _notify_main_agent(group_id: str) -> None:
@@ -93,11 +106,84 @@ async def _notify_main_agent(group_id: str) -> None:
         + "\n\n".join(parts)
     )
 
+    # Delete ephemeral progress messages
+    if _app_state is not None:
+        backend = getattr(_app_state, "backend", None)
+        if backend is not None and hasattr(type(backend), "delete_progress"):
+            for _aid2, agent in group:
+                msg_id = agent.get("progress_message_id")
+                if msg_id is not None:
+                    await backend.delete_progress(msg_id)
+
     if _message_queue is not None:
         await _message_queue.put(("agent_callback", synthetic_text))
         logger.info("Group %s: pushed callback with %d agent results", group_id, len(group))
     else:
-        logger.warning("Group %s completed but no message queue available", group_id)
+        logger.error("Group %s completed but no message queue — results DROPPED", group_id)
+
+
+def _on_agent_done(agent_id: str, task: asyncio.Task) -> None:
+    """Done-callback: detect crashes that escaped _run_agent's try/except."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return  # Normal completion — _run_agent already updated status
+    error_msg = f"{type(exc).__name__}: {exc}"
+    _agents[agent_id]["status"] = "failed"
+    _agents[agent_id]["error"] = error_msg
+    _agents[agent_id].setdefault(
+        "finished_at", datetime.now(timezone.utc).isoformat()
+    )
+    logger.error("Agent %s crashed (done-callback): %s", agent_id[:8], error_msg)
+
+    group_id = _agents[agent_id].get("group_id")
+    if group_id and _check_group_complete(group_id):
+        asyncio.create_task(
+            _notify_main_agent(group_id),
+            name=f"agent-notify-{group_id}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat watchdog
+# ---------------------------------------------------------------------------
+
+async def _watchdog_tick() -> None:
+    """Single pass: cancel any stuck agents."""
+    now = datetime.now(timezone.utc)
+    for agent_id, info in list(_agents.items()):
+        if info["status"] != "running":
+            continue
+        last = info.get("last_activity")
+        if last is None:
+            continue
+        elapsed = (now - last).total_seconds()
+        if elapsed > _WATCHDOG_TIMEOUT:
+            task = info.get("task")
+            if task is not None and not task.done():
+                logger.warning(
+                    "Watchdog: cancelling agent %s (no activity for %.0fs)",
+                    agent_id[:8], elapsed,
+                )
+                task.cancel()
+
+
+async def _watchdog_loop() -> None:
+    """Background loop that runs _watchdog_tick periodically."""
+    while True:
+        await asyncio.sleep(_WATCHDOG_INTERVAL)
+        try:
+            await _watchdog_tick()
+        except Exception:
+            logger.exception("Watchdog tick failed")
+
+
+def start_watchdog() -> None:
+    """Start the watchdog background task."""
+    global _watchdog_task
+    if _watchdog_task is None or _watchdog_task.done():
+        _watchdog_task = asyncio.create_task(_watchdog_loop(), name="agent-watchdog")
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +198,7 @@ async def _run_agent(
     tools_filter: list[str] | None,
     max_iterations: int,
     system_suffix: str | None = None,
+    tool_limits: dict[str, int] | None = None,
 ) -> None:
     """Background task that runs a self-contained tool loop and notifies on completion."""
     _agents[agent_id]["status"] = "running"
@@ -156,6 +243,10 @@ async def _run_agent(
             {"role": "user", "content": prompt},
         ]
 
+        # Heartbeat callback — updates last_activity on every tool event
+        def _heartbeat(event: Any) -> None:
+            _agents[agent_id]["last_activity"] = datetime.now(timezone.utc)
+
         # Run tool loop with usage tracking
         result_text, usage = await run_tool_loop(
             client=app_state.router_client,
@@ -166,6 +257,8 @@ async def _run_agent(
             max_iterations=max_iterations,
             executor=app_state.executor,
             track_usage=True,
+            tool_limits=tool_limits,
+            on_event=_heartbeat,
         )
 
         _agents[agent_id]["status"] = "completed"
@@ -173,6 +266,11 @@ async def _run_agent(
         _agents[agent_id]["result_preview"] = result_text[:200]
         _agents[agent_id]["usage"] = usage
         logger.info("Agent %s completed", agent_id[:8])
+
+    except asyncio.CancelledError:
+        _agents[agent_id]["status"] = "timed_out"
+        _agents[agent_id]["error"] = "Agent timed out: no activity for too long"
+        logger.warning("Agent %s timed out (cancelled by watchdog)", agent_id[:8])
 
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
@@ -182,6 +280,25 @@ async def _run_agent(
 
     finally:
         _agents[agent_id]["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+        # Edit progress message with per-agent status
+        progress_msg_id = _agents[agent_id].get("progress_message_id")
+        if progress_msg_id is not None:
+            backend = getattr(app_state, "backend", None)
+            if backend is not None and hasattr(type(backend), "edit_progress"):
+                group_id = _agents[agent_id].get("group_id")
+                if group_id:
+                    group = [a for a in _agents.values() if a.get("group_id") == group_id]
+                    done = sum(1 for a in group if a["status"] in ("completed", "failed", "timed_out"))
+                    total = len(group)
+                    status_emoji = "\u2705" if _agents[agent_id]["status"] == "completed" else "\u274c"
+                    try:
+                        await backend.edit_progress(
+                            progress_msg_id,
+                            f"{status_emoji} {_agents[agent_id].get('name', 'agent')} done ({done}/{total})",
+                        )
+                    except Exception:
+                        pass
 
         # Check if the group is complete and notify
         group_id = _agents[agent_id].get("group_id")
@@ -223,11 +340,13 @@ async def _handle_spawn(
     # Resolve agent type
     tools_filter = tools
     system_suffix: str | None = None
+    agent_tool_limits: dict[str, int] | None = _DEFAULT_AGENT_LIMITS
     if agent_type and agent_type in AGENT_TYPES:
         archetype = AGENT_TYPES[agent_type]
         if tools_filter is None:
             tools_filter = archetype["tools"]
         system_suffix = archetype["system_suffix"]
+        agent_tool_limits = archetype.get("tool_limits", _DEFAULT_AGENT_LIMITS)
 
     # Assign group_id (create new one if not provided)
     resolved_group_id = group_id or str(uuid.uuid4())[:8]
@@ -240,16 +359,26 @@ async def _handle_spawn(
         "group_id": resolved_group_id,
         "agent_type": agent_type,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "last_activity": datetime.now(timezone.utc),
     }
 
-    # Launch as background task
-    asyncio.create_task(
+    # Launch as background task with done-callback for crash detection
+    task = asyncio.create_task(
         _run_agent(
             agent_id, prompt, app_state, model, tools_filter,
             max_iterations, system_suffix,
+            tool_limits=agent_tool_limits,
         ),
         name=f"agent-{agent_id}",
     )
+    _agents[agent_id]["task"] = task
+    task.add_done_callback(lambda t, aid=agent_id: _on_agent_done(aid, t))
+
+    # Send ephemeral progress message (Telegram-specific)
+    backend = getattr(app_state, "backend", None)
+    if backend is not None and hasattr(type(backend), "send_progress"):
+        msg_id = await backend.send_progress(f"\u23f3 Working on: {name}...")
+        _agents[agent_id]["progress_message_id"] = msg_id
 
     logger.info("Spawned agent %s: %s (group=%s)", agent_id, name, resolved_group_id)
     return json.dumps({
@@ -264,15 +393,24 @@ async def _handle_list_agents() -> str:
     """List all agents and their status."""
     agents = []
     for aid, info in _agents.items():
+        task = info.get("task")
         entry: dict[str, Any] = {
             "id": aid,
             "name": info.get("name"),
             "status": info.get("status"),
+            "agent_type": info.get("agent_type"),
+            "group_id": info.get("group_id"),
             "created_at": info.get("created_at"),
             "finished_at": info.get("finished_at"),
         }
+        if info.get("error"):
+            entry["error"] = info["error"]
+        if info.get("result_preview"):
+            entry["result_preview"] = info["result_preview"]
         if "usage" in info:
             entry["usage"] = info["usage"]
+        if task is not None:
+            entry["is_alive"] = not task.done()
         agents.append(entry)
     # Most recent first
     agents.sort(key=lambda a: a.get("created_at", ""), reverse=True)
@@ -327,6 +465,8 @@ LIST_AGENTS_SCHEMA: dict[str, Any] = {
 
 def register(registry: Any, config: dict[str, Any], app_state: Any) -> None:
     """Register spawn_agent and list_agents tools."""
+    global _app_state
+    _app_state = app_state
 
     async def _spawn_handler(
         name: str,

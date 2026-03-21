@@ -194,6 +194,33 @@ class TelegramBackend:
             chat_id=self._chat_id, action=ChatAction.TYPING,
         )
 
+    async def send_progress(self, text: str) -> int | None:
+        """Send an ephemeral progress message and return its message_id."""
+        try:
+            msg = await self.bot.send_message(chat_id=self._chat_id, text=text)
+            return msg.message_id
+        except Exception:
+            logger.exception("Failed to send progress message")
+            return None
+
+    async def edit_progress(self, message_id: int, text: str) -> None:
+        """Edit a previously sent progress message."""
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self._chat_id, message_id=message_id, text=text,
+            )
+        except Exception:
+            logger.exception("Failed to edit progress message %d", message_id)
+
+    async def delete_progress(self, message_id: int) -> None:
+        """Delete an ephemeral progress message."""
+        try:
+            await self.bot.delete_message(
+                chat_id=self._chat_id, message_id=message_id,
+            )
+        except Exception:
+            logger.exception("Failed to delete progress message %d", message_id)
+
     async def send_notification(
         self, text: str, actions: list[dict] | None = None,
     ) -> None:
@@ -225,7 +252,7 @@ class TelegramBackend:
             BotCommand("forget", "Start a new conversation"),
             BotCommand("model", "Set model for a role (/model <role> <id>)"),
             BotCommand("models", "List available models from OpenRouter"),
-            BotCommand("roles", "List available model roles"),
+            BotCommand("roles", "List roles with assigned models"),
             BotCommand("plan", "Deep thinking: plan before executing"),
             BotCommand("mcp", "List connected MCP servers and tools"),
         ])

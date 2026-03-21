@@ -130,15 +130,29 @@ class TestCmdModel:
 
 class TestCmdRoles:
     @pytest.mark.asyncio
-    async def test_lists_all_roles(self):
+    async def test_lists_all_roles_with_models(self):
         from spare_paw.core.commands import cmd_roles
 
-        result = await cmd_roles()
+        app_state = MagicMock()
+        app_state.config.get.side_effect = lambda key, default="": {
+            "models.main_agent": "google/gemini-3.1-flash-lite-preview",
+            "models.coder": "z-ai/glm-5",
+            "models.planner": "",
+            "models.cron": "",
+            "models.researcher": "",
+            "models.analyst": "",
+            "models.summary": "",
+        }.get(key, default)
+
+        result = await cmd_roles(app_state)
 
         assert "main_agent" in result
         assert "coder" in result
         assert "researcher" in result
         assert "summary" in result
+        assert "google/gemini-3.1-flash-lite-preview" in result
+        assert "z-ai/glm-5" in result
+        assert "→" in result
         assert "/model" in result
 
 

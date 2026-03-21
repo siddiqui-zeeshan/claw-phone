@@ -150,19 +150,32 @@ async def assemble(
     messages = [{"role": "system", "content": system_prompt}]
 
     # Inject summary nodes (compressed history) between system prompt and fresh messages
+    # Only inject the most recent summaries up to the token budget; older ones
+    # remain searchable via lcm_grep but aren't included in every request.
+    summary_budget = config.get("context.summary_token_budget", 5000)
     try:
         async with db.execute(
-            """SELECT content FROM summary_nodes
+            """SELECT content, token_count FROM summary_nodes
                WHERE conversation_id = ? AND parent_id IS NULL
-               ORDER BY created_at ASC""",
+               ORDER BY created_at DESC""",
             (conversation_id,),
         ) as cursor:
             summary_rows = await cursor.fetchall()
 
+        summary_tokens_used = 0
+        selected_summaries: list[str] = []
         for srow in summary_rows:
+            tokens = srow["token_count"]
+            if summary_tokens_used + tokens > summary_budget:
+                break
+            summary_tokens_used += tokens
+            selected_summaries.append(srow["content"])
+
+        # Reverse to chronological order (we fetched newest-first)
+        for content in reversed(selected_summaries):
             messages.append({
                 "role": "system",
-                "content": f"[Compressed History]\n{srow['content']}",
+                "content": f"[Compressed History]\n{content}",
             })
     except Exception:
         # summary_nodes table may not exist in older schemas
