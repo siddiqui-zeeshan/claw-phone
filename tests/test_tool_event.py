@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from spare_paw.router.tool_loop import ToolEvent, run_tool_loop
+from spare_paw.router.tool_loop import DEFAULT_TOOL_LIMITS, ToolEvent, run_tool_loop
 
 
 def _text_response(content: str = "done") -> dict:
@@ -159,3 +159,16 @@ class TestOnTokenCallback:
             on_token=None,
         )
         assert result == "hi"
+
+
+class TestDefaultToolLimits:
+    def test_shell_limit(self):
+        assert DEFAULT_TOOL_LIMITS["shell"] == 20
+
+    def test_spawn_agent_limit(self):
+        assert DEFAULT_TOOL_LIMITS["spawn_agent"] == 5
+
+    def test_web_limits_unchanged(self):
+        assert DEFAULT_TOOL_LIMITS["web_scrape"] == 5
+        assert DEFAULT_TOOL_LIMITS["web_search"] == 5
+        assert DEFAULT_TOOL_LIMITS["tavily_search"] == 5

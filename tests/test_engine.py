@@ -362,6 +362,19 @@ class TestEnqueue:
         engine_mod._message_queue = None
         await enqueue(IncomingMessage(text="ignored"))  # should not raise
 
+    @pytest.mark.asyncio
+    async def test_enqueue_logs_error_when_no_queue(self, caplog):
+        """enqueue logs ERROR when queue is None."""
+        import logging
+        import spare_paw.core.engine as engine_mod
+
+        engine_mod._message_queue = None
+        with caplog.at_level(logging.ERROR, logger="spare_paw.core.engine"):
+            await enqueue(IncomingMessage(text="dropped"))
+        assert any("DROPPED" in r.message for r in caplog.records), (
+            "Expected ERROR log with 'DROPPED' when queue is None"
+        )
+
 
 class TestStartQueueProcessor:
     @pytest.mark.asyncio

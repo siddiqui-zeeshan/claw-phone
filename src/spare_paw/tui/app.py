@@ -437,7 +437,7 @@ if HAS_TEXTUAL:
 
             if text.lower() == "/roles":
                 from spare_paw.core.commands import cmd_roles
-                result = await cmd_roles()
+                result = await cmd_roles(self.app_state)
                 log_widget.write(result)
                 return
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -443,6 +444,360 @@ def test_agents_cannot_use_send_message_or_send_file():
 
     tool_names = {t["function"]["name"] for t in filtered}
     assert tool_names == {"shell", "files"}
+
+
+# ---------------------------------------------------------------------------
+# Per-agent-type tool limits
+# ---------------------------------------------------------------------------
+
+def test_agent_types_have_tool_limits():
+    """Each AGENT_TYPES entry must have a tool_limits dict."""
+    for key, archetype in subagent_mod.AGENT_TYPES.items():
+        assert "tool_limits" in archetype, f"AGENT_TYPES['{key}'] missing 'tool_limits'"
+        assert isinstance(archetype["tool_limits"], dict)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_forwards_tool_limits_to_tool_loop():
+    """_run_agent passes tool_limits to run_tool_loop."""
+    app_state = _make_app_state()
+    agent_id = "limits-test"
+    subagent_mod._agents[agent_id] = {
+        "name": "limiter",
+        "prompt": "test",
+        "status": "starting",
+        "group_id": "grp",
+        "agent_type": "coder",
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    expected_limits = {"shell": 30, "web_search": 3}
+
+    with patch("spare_paw.router.tool_loop.run_tool_loop", return_value=("ok", {})) as mock_loop:
+        with patch("spare_paw.bot.handler._build_system_prompt", return_value="sys"):
+            await subagent_mod._run_agent(
+                agent_id, "test", app_state,
+                model=None, tools_filter=None, max_iterations=5,
+                tool_limits=expected_limits,
+            )
+
+    assert mock_loop.call_args.kwargs.get("tool_limits") == expected_limits
+
+
+@pytest.mark.asyncio
+async def test_default_agent_limits_when_no_type():
+    """Spawn without agent_type uses _DEFAULT_AGENT_LIMITS."""
+    app_state = _make_app_state()
+
+    with patch.object(subagent_mod, "_run_agent", side_effect=_noop_run_agent) as mock_run:
+        await subagent_mod._handle_spawn(app_state, name="generic", prompt="do stuff")
+
+    call_args = mock_run.call_args
+    tool_limits = call_args[1].get("tool_limits") if call_args[1] else None
+    assert tool_limits == subagent_mod._DEFAULT_AGENT_LIMITS
+    await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat watchdog
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_agent_has_last_activity():
+    """Spawned agent has a last_activity datetime field."""
+    app_state = _make_app_state()
+
+    with patch.object(subagent_mod, "_run_agent", side_effect=_noop_run_agent):
+        await subagent_mod._handle_spawn(app_state, name="hb", prompt="test")
+
+    agent_id = next(iter(subagent_mod._agents))
+    assert "last_activity" in subagent_mod._agents[agent_id]
+    assert isinstance(subagent_mod._agents[agent_id]["last_activity"], datetime)
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_cancels_stuck_agent():
+    """Watchdog cancels agents with no recent activity."""
+    mock_task = MagicMock()
+    mock_task.done.return_value = False
+
+    subagent_mod._agents["stuck-1"] = {
+        "name": "stuck",
+        "status": "running",
+        "last_activity": datetime.now(timezone.utc) - timedelta(seconds=300),
+        "task": mock_task,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    await subagent_mod._watchdog_tick()
+    mock_task.cancel.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_ignores_active_agent():
+    """Watchdog does not cancel agents with recent activity."""
+    mock_task = MagicMock()
+    mock_task.done.return_value = False
+
+    subagent_mod._agents["active-1"] = {
+        "name": "active",
+        "status": "running",
+        "last_activity": datetime.now(timezone.utc) - timedelta(seconds=10),
+        "task": mock_task,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    await subagent_mod._watchdog_tick()
+    mock_task.cancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_ignores_completed_agent():
+    """Watchdog does not cancel completed agents even with old last_activity."""
+    mock_task = MagicMock()
+    mock_task.done.return_value = True
+
+    subagent_mod._agents["done-1"] = {
+        "name": "done",
+        "status": "completed",
+        "last_activity": datetime.now(timezone.utc) - timedelta(seconds=300),
+        "task": mock_task,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    await subagent_mod._watchdog_tick()
+    mock_task.cancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_agent_sets_timed_out():
+    """CancelledError in _run_agent sets status to timed_out."""
+    app_state = _make_app_state()
+    agent_id = "timeout-test"
+    subagent_mod._agents[agent_id] = {
+        "name": "timeouter",
+        "prompt": "test",
+        "status": "starting",
+        "group_id": "grp",
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    async def _raise_cancelled(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    with patch("spare_paw.router.tool_loop.run_tool_loop", side_effect=_raise_cancelled):
+        with patch("spare_paw.bot.handler._build_system_prompt", return_value="sys"):
+            await subagent_mod._run_agent(
+                agent_id, "test", app_state,
+                model=None, tools_filter=None, max_iterations=5,
+            )
+
+    assert subagent_mod._agents[agent_id]["status"] == "timed_out"
+    assert "timed out" in subagent_mod._agents[agent_id]["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral progress messages
+# ---------------------------------------------------------------------------
+
+class _ProgressBackend:
+    """Fake backend class with progress methods for testing."""
+    send_progress = AsyncMock(return_value=42)
+    edit_progress = AsyncMock()
+    delete_progress = AsyncMock()
+
+
+@pytest.mark.asyncio
+async def test_spawn_sends_progress_message():
+    """Spawn sends a progress message via backend.send_progress."""
+    app_state = _make_app_state()
+    backend = _ProgressBackend()
+    backend.send_progress = AsyncMock(return_value=42)
+    app_state.backend = backend
+
+    with patch.object(subagent_mod, "_run_agent", side_effect=_noop_run_agent):
+        await subagent_mod._handle_spawn(app_state, name="prog", prompt="test")
+
+    backend.send_progress.assert_called_once()
+    agent_id = next(iter(subagent_mod._agents))
+    assert subagent_mod._agents[agent_id]["progress_message_id"] == 42
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_group_complete_deletes_progress():
+    """_notify_main_agent deletes progress messages for the group."""
+    group_id = "prog-group"
+    backend = _ProgressBackend()
+    backend.delete_progress = AsyncMock()
+
+    mock_app_state = MagicMock()
+    mock_app_state.backend = backend
+    subagent_mod._app_state = mock_app_state
+
+    subagent_mod._agents["pg-1"] = {
+        "name": "agent1",
+        "status": "completed",
+        "result": "result1",
+        "group_id": group_id,
+        "progress_message_id": 101,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    queue = asyncio.Queue()
+    original_queue = subagent_mod._message_queue
+    subagent_mod._message_queue = queue
+    try:
+        await subagent_mod._notify_main_agent(group_id)
+        backend.delete_progress.assert_called_once_with(101)
+    finally:
+        subagent_mod._message_queue = original_queue
+        subagent_mod._app_state = None
+
+
+@pytest.mark.asyncio
+async def test_no_progress_without_backend_support():
+    """Spawn succeeds even if backend lacks send_progress."""
+    app_state = _make_app_state()
+    app_state.backend = MagicMock(spec=[])  # No send_progress attribute
+
+    with patch.object(subagent_mod, "_run_agent", side_effect=_noop_run_agent):
+        result = json.loads(
+            await subagent_mod._handle_spawn(app_state, name="noprog", prompt="test")
+        )
+
+    assert result["__stop_turn__"] is True
+    agent_id = next(iter(subagent_mod._agents))
+    assert subagent_mod._agents[agent_id].get("progress_message_id") is None
+    await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Integration: full dispatch path (tool_loop → registry → _spawn_handler)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Robust agent tracking (done-callback, enriched list, null-queue escalation)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_spawn_stores_task_reference():
+    """Spawned agents must have an asyncio.Task stored in _agents."""
+    app_state = _make_app_state()
+
+    with patch.object(subagent_mod, "_run_agent", side_effect=_noop_run_agent):
+        await subagent_mod._handle_spawn(app_state, name="tracked", prompt="test")
+
+    agent_id = next(iter(subagent_mod._agents))
+    agent = subagent_mod._agents[agent_id]
+    assert "task" in agent, "Agent entry must contain a 'task' key"
+    assert isinstance(agent["task"], asyncio.Task)
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_done_callback_detects_crash():
+    """If an agent task raises outside _run_agent's try/except, done-callback catches it."""
+    agent_id = "crash-test"
+    group_id = "crash-group"
+
+    async def _crashing_agent(*args, **kwargs):
+        raise RuntimeError("unexpected crash")
+
+    subagent_mod._agents[agent_id] = {
+        "name": "crasher",
+        "prompt": "test",
+        "status": "starting",
+        "group_id": group_id,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    task = asyncio.create_task(_crashing_agent(), name=f"agent-{agent_id}")
+    subagent_mod._agents[agent_id]["task"] = task
+    task.add_done_callback(lambda t, aid=agent_id: subagent_mod._on_agent_done(aid, t))
+
+    # Wait for task to complete and callback to fire
+    try:
+        await task
+    except RuntimeError:
+        pass
+    await asyncio.sleep(0)
+
+    agent = subagent_mod._agents[agent_id]
+    assert agent["status"] == "failed"
+    assert "RuntimeError" in agent["error"]
+    assert "finished_at" in agent
+
+
+@pytest.mark.asyncio
+async def test_null_queue_logs_error(caplog):
+    """_notify_main_agent logs ERROR (not WARNING) when queue is None."""
+    group_id = "null-queue-group"
+    subagent_mod._agents["nq-1"] = {
+        "name": "agent1",
+        "status": "completed",
+        "result": "some result",
+        "group_id": group_id,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    original_queue = subagent_mod._message_queue
+    subagent_mod._message_queue = None
+    try:
+        import logging
+        with caplog.at_level(logging.ERROR, logger="spare_paw.tools.subagent"):
+            await subagent_mod._notify_main_agent(group_id)
+        assert any("DROPPED" in r.message for r in caplog.records), (
+            "Expected ERROR log with 'DROPPED' when queue is None"
+        )
+    finally:
+        subagent_mod._message_queue = original_queue
+
+
+@pytest.mark.asyncio
+async def test_list_agents_includes_enriched_fields():
+    """list_agents output includes error, result_preview, agent_type, group_id, is_alive."""
+    mock_task = MagicMock()
+    mock_task.done.return_value = True
+
+    subagent_mod._agents["e1"] = {
+        "name": "failed-agent",
+        "status": "failed",
+        "error": "RuntimeError: boom",
+        "result_preview": None,
+        "agent_type": "researcher",
+        "group_id": "grp-1",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "finished_at": "2026-01-01T00:01:00+00:00",
+        "task": mock_task,
+    }
+    subagent_mod._agents["e2"] = {
+        "name": "ok-agent",
+        "status": "completed",
+        "result": "full result text here",
+        "result_preview": "full result text here",
+        "agent_type": "coder",
+        "group_id": "grp-1",
+        "created_at": "2026-01-01T00:02:00+00:00",
+        "finished_at": "2026-01-01T00:03:00+00:00",
+        "task": mock_task,
+    }
+
+    result = json.loads(await subagent_mod._handle_list_agents())
+    assert result["count"] == 2
+
+    # Check enriched fields on the failed agent (second in list, sorted by created_at desc)
+    failed = next(a for a in result["agents"] if a["name"] == "failed-agent")
+    assert failed["error"] == "RuntimeError: boom"
+    assert failed["agent_type"] == "researcher"
+    assert failed["group_id"] == "grp-1"
+    assert "is_alive" in failed
+    assert failed["is_alive"] is False
+
+    ok = next(a for a in result["agents"] if a["name"] == "ok-agent")
+    assert ok["result_preview"] == "full result text here"
+    assert ok["agent_type"] == "coder"
 
 
 # ---------------------------------------------------------------------------

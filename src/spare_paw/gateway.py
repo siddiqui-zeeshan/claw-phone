@@ -290,7 +290,6 @@ async def _async_main() -> None:
 
     # 10. Build backend (Telegram or webhook)
     backend_type = config.get("backend", "telegram")
-    start_queue_processor = None
 
     if backend_type == "webhook":
         from spare_paw.webhook.backend import WebhookBackend
@@ -318,12 +317,11 @@ async def _async_main() -> None:
 
         # Register Telegram handlers
         try:
-            from spare_paw.bot.handler import setup_handlers, start_queue_processor
+            from spare_paw.bot.handler import setup_handlers
 
             setup_handlers(backend._application)
             logger.info("Bot handlers registered")
         except ImportError:
-            start_queue_processor = None
             logger.warning("bot.handler not yet implemented; skipping handler registration")
 
     # 10b. Start secondary webhook backend if enabled alongside primary
@@ -376,8 +374,8 @@ async def _async_main() -> None:
         logger.info("Webhook API listening on port %d", config.get("webhook.port", 8080))
 
     # 16. Start message queue processor (must be after initialize/start)
-    if start_queue_processor is not None:
-        start_queue_processor(backend._application)
+    from spare_paw.core.engine import start_queue_processor as _start_queue
+    _start_queue(app_state, backend)
 
     logger.info("Bot started (%s backend)", backend_type)
 
