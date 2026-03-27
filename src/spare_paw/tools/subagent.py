@@ -13,16 +13,200 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from collections.abc import Callable
 from typing import Any
 
+from dataclasses import dataclass, field
+
 from spare_paw.config import resolve_model
+
+
+class _AgentToolRegistry:
+    """Thin wrapper that intercepts consult_main and delegates everything else."""
+
+    def __init__(self, real_registry: Any, consult_handler: Callable) -> None:
+        self._real = real_registry
+        self._consult_handler = consult_handler
+
+    async def execute(
+        self, name: str, arguments: dict[str, Any], executor: Any = None
+    ) -> str:
+        if name == "consult_main":
+            return await self._consult_handler(**arguments)
+        return await self._real.execute(name, arguments, executor)
+
+    def get_schemas(self) -> list[dict[str, Any]]:
+        return self._real.get_schemas()
 
 logger = logging.getLogger(__name__)
 
 # Active and completed agents
 _agents: dict[str, dict[str, Any]] = {}
-_MAX_CONCURRENT = 3
-_MAX_PER_GROUP = 3  # max agents in a single group/batch
+_MAX_CONCURRENT = 10
+_MAX_PER_GROUP = 5  # max agents in a single group/batch
+
+@dataclass
+class DialogueChannel:
+    agent_id: str
+    original_request: str
+    spawn_prompt: str
+    to_main: asyncio.Queue
+    max_rounds: int = 5
+    round_count: int = 0
+    history: list[dict] = field(default_factory=list)
+    consumer_task: asyncio.Task | None = None
+    closed: bool = False
+
+
+# Active dialogue channels keyed by agent_id
+_channels: dict[str, DialogueChannel] = {}
+
+CONSULT_SYSTEM_PROMPT = (
+    "You are the main agent coordinating background agents. A subagent is consulting "
+    "you for guidance. You know the original user request and what this agent was "
+    "tasked with. Answer concisely and directly. If the agent is on the wrong track, "
+    "redirect it. If it needs information you don't have, say so."
+)
+
+
+async def _update_progress(channel: DialogueChannel, app_state: Any) -> None:
+    """Edit the agent's progress message to show consult status."""
+    agent = _agents.get(channel.agent_id)
+    if agent is None:
+        return
+    msg_id = agent.get("progress_message_id")
+    if msg_id is None:
+        return
+    backend = getattr(app_state, "backend", None)
+    if backend and hasattr(type(backend), "edit_progress"):
+        name = agent.get("name", "agent")
+        try:
+            await backend.edit_progress(
+                msg_id,
+                f"\U0001f4ac {name}: consulting main agent "
+                f"(round {channel.round_count}/{channel.max_rounds})",
+            )
+        except Exception:
+            pass
+
+
+async def _dialogue_consumer(channel: DialogueChannel, app_state: Any) -> None:
+    """Consumer coroutine: receives questions from subagent, calls main-agent LLM, resolves Futures."""
+    try:
+        while not channel.closed:
+            question, future = await channel.to_main.get()
+
+            try:
+                messages: list[dict[str, Any]] = [
+                    {"role": "system", "content": CONSULT_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Original request: {channel.original_request}"},
+                    {"role": "user", "content": f"Agent task: {channel.spawn_prompt}"},
+                ]
+                for entry in channel.history:
+                    messages.append(entry)
+                messages.append({"role": "user", "content": question})
+
+                model = resolve_model(app_state.config, "main_agent")
+                response = await app_state.router_client.chat(messages, model)
+                answer = response["choices"][0]["message"].get("content", "")
+
+                channel.history.append({"role": "user", "content": question})
+                channel.history.append({"role": "assistant", "content": answer})
+                channel.round_count += 1
+
+                if not future.done():
+                    future.set_result(answer)
+
+                await _update_progress(channel, app_state)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Dialogue consumer LLM call failed for agent %s",
+                    channel.agent_id[:8],
+                )
+                if not future.done():
+                    future.set_result(
+                        "Error: consult failed due to an internal error. "
+                        "Continue with what you have."
+                    )
+
+    except asyncio.CancelledError:
+        logger.info("Dialogue consumer for agent %s cancelled", channel.agent_id[:8])
+
+
+def _cleanup_channel(agent_id: str) -> None:
+    """Tear down a dialogue channel: cancel consumer, resolve pending futures."""
+    channel = _channels.get(agent_id)
+    if channel is None:
+        return
+    channel.closed = True
+    if channel.consumer_task and not channel.consumer_task.done():
+        channel.consumer_task.cancel()
+    while not channel.to_main.empty():
+        try:
+            _, future = channel.to_main.get_nowait()
+            if not future.done():
+                future.set_result("Error: agent terminated, consult cancelled")
+        except asyncio.QueueEmpty:
+            break
+    del _channels[agent_id]
+
+
+_CONSULT_HEARTBEAT_INTERVAL = 15  # seconds
+
+
+async def _consult_heartbeat(agent_id: str, future: asyncio.Future) -> None:
+    """Tick last_activity while a consult Future is pending."""
+    try:
+        while not future.done():
+            _agents[agent_id]["last_activity"] = datetime.now(timezone.utc)
+            await asyncio.sleep(_CONSULT_HEARTBEAT_INTERVAL)
+    except asyncio.CancelledError:
+        pass
+
+
+async def _handle_consult(agent_id: str, question: str) -> str:
+    """Handle a consult_main tool call from a subagent."""
+    channel = _channels.get(agent_id)
+    if channel is None:
+        return json.dumps({"error": "No dialogue channel for this agent"})
+
+    if channel.round_count >= channel.max_rounds:
+        return json.dumps({
+            "error": f"Consultation limit reached ({channel.max_rounds}/{channel.max_rounds}). "
+            "Continue with the information you have.",
+        })
+
+    if len(question) > 2000:
+        return json.dumps({
+            "error": f"Question too long ({len(question)} chars, max 2000). "
+            "Summarize before consulting.",
+        })
+
+    if agent_id in _agents:
+        _agents[agent_id]["last_activity"] = datetime.now(timezone.utc)
+
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    await channel.to_main.put((question, future))
+
+    hb_task = asyncio.create_task(
+        _consult_heartbeat(agent_id, future),
+        name=f"consult-hb-{agent_id}",
+    )
+
+    try:
+        answer = await future
+    finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+
+    return answer
+
 
 # Reference to the message queue — set by engine.py at startup
 _message_queue: asyncio.Queue | None = None
@@ -41,11 +225,17 @@ _watchdog_task: asyncio.Task | None = None
 
 _DEFAULT_AGENT_LIMITS: dict[str, int] = {"shell": 15, "web_search": 5}
 
+_CONSULT_NUDGE = (
+    " If you are unsure about scope, priorities, or direction, use consult_main "
+    "to ask the main agent before proceeding."
+)
+
 AGENT_TYPES: dict[str, dict[str, Any]] = {
     "researcher": {
         "system_suffix": (
             "You are a research agent. Search thoroughly, use multiple sources, "
             "and cite URLs when possible. Focus on finding accurate, up-to-date information."
+            + _CONSULT_NUDGE
         ),
         "tools": ["tavily_search", "web_scrape", "shell", "files"],
         "tool_limits": {"web_search": 10, "tavily_search": 10, "shell": 10},
@@ -54,6 +244,7 @@ AGENT_TYPES: dict[str, dict[str, Any]] = {
         "system_suffix": (
             "You are a coding agent. Write, test, and debug code. "
             "Use the shell to run commands and verify your work."
+            + _CONSULT_NUDGE
         ),
         "tools": ["shell", "files", "code"],
         "tool_limits": {"shell": 30, "web_search": 3},
@@ -62,6 +253,7 @@ AGENT_TYPES: dict[str, dict[str, Any]] = {
         "system_suffix": (
             "You are an analysis agent. Analyze data, produce summaries, "
             "and extract key insights. Be thorough but concise."
+            + _CONSULT_NUDGE
         ),
         "tools": ["files", "shell", "tavily_search"],
         "tool_limits": {"shell": 15, "web_search": 5, "tavily_search": 5},
@@ -136,6 +328,8 @@ def _on_agent_done(agent_id: str, task: asyncio.Task) -> None:
         "finished_at", datetime.now(timezone.utc).isoformat()
     )
     logger.error("Agent %s crashed (done-callback): %s", agent_id[:8], error_msg)
+
+    _cleanup_channel(agent_id)
 
     group_id = _agents[agent_id].get("group_id")
     if group_id and _check_group_complete(group_id):
@@ -237,6 +431,34 @@ async def _run_agent(
             if s.get("function", {}).get("name") not in _agent_tools
         ]
 
+        # Inject consult_main tool (subagent-only, not in global registry)
+        async def _consult_handler(question: str) -> str:
+            return await _handle_consult(agent_id, question)
+
+        consult_schema = {
+            "type": "function",
+            "function": {
+                "name": "consult_main",
+                "description": (
+                    "Consult the main agent for clarification, guidance, or to share partial results. "
+                    "Use when you need direction, hit ambiguity, or want to confirm your approach. "
+                    "Keep questions concise (under 2000 chars). You have up to 5 consultation rounds."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "Your question or partial results for the main agent. Must be under 2000 characters.",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            },
+        }
+        tool_schemas.append(consult_schema)
+        agent_registry = _AgentToolRegistry(app_state.tool_registry, _consult_handler)
+
         # Build messages
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -253,7 +475,7 @@ async def _run_agent(
             messages=messages,
             model=resolved_model,
             tools=tool_schemas,
-            tool_registry=app_state.tool_registry,
+            tool_registry=agent_registry,
             max_iterations=max_iterations,
             executor=app_state.executor,
             track_usage=True,
@@ -280,6 +502,8 @@ async def _run_agent(
 
     finally:
         _agents[agent_id]["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+        _cleanup_channel(agent_id)
 
         # Edit progress message with per-agent status
         progress_msg_id = _agents[agent_id].get("progress_message_id")
@@ -361,6 +585,20 @@ async def _handle_spawn(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "last_activity": datetime.now(timezone.utc),
     }
+
+    # Create dialogue channel
+    original_request = getattr(app_state, "current_request", prompt)
+    channel = DialogueChannel(
+        agent_id=agent_id,
+        original_request=original_request,
+        spawn_prompt=prompt,
+        to_main=asyncio.Queue(),
+    )
+    channel.consumer_task = asyncio.create_task(
+        _dialogue_consumer(channel, app_state),
+        name=f"dialogue-{agent_id}",
+    )
+    _channels[agent_id] = channel
 
     # Launch as background task with done-callback for crash detection
     task = asyncio.create_task(

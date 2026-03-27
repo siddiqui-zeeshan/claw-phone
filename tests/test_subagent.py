@@ -18,10 +18,12 @@ import spare_paw.tools.subagent as subagent_mod
 
 @pytest.fixture(autouse=True)
 def _reset_agents():
-    """Clear the global _agents dict before each test."""
+    """Clear the global _agents and _channels dicts before each test."""
     subagent_mod._agents.clear()
+    subagent_mod._channels.clear()
     yield
     subagent_mod._agents.clear()
+    subagent_mod._channels.clear()
 
 
 def _make_app_state() -> MagicMock:
@@ -73,8 +75,9 @@ async def test_spawn_creates_agent_entry():
 async def test_spawn_respects_max_concurrent():
     app_state = _make_app_state()
 
-    # Pre-populate _agents with 3 running agents
-    for i in range(3):
+    # Pre-populate _agents up to _MAX_CONCURRENT running agents
+    max_c = subagent_mod._MAX_CONCURRENT
+    for i in range(max_c):
         subagent_mod._agents[f"fake-{i}"] = {
             "name": f"agent-{i}",
             "status": "running",
@@ -82,12 +85,12 @@ async def test_spawn_respects_max_concurrent():
         }
 
     result = json.loads(
-        await subagent_mod._handle_spawn(app_state, name="fourth", prompt="overflow")
+        await subagent_mod._handle_spawn(app_state, name="overflow", prompt="overflow")
     )
 
     assert "error" in result
     assert "Max concurrent" in result["error"]
-    assert result["running"] == 3
+    assert result["running"] == max_c
 
 
 # ---------------------------------------------------------------------------
@@ -869,3 +872,497 @@ async def test_tool_loop_to_spawn_handler_integration():
 
     # Let background tasks finish
     await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional dialogue — DialogueChannel
+# ---------------------------------------------------------------------------
+
+def test_dialogue_channel_dataclass_exists():
+    """DialogueChannel dataclass has expected fields."""
+    channel = subagent_mod.DialogueChannel(
+        agent_id="test-1",
+        original_request="user request",
+        spawn_prompt="do research",
+        to_main=asyncio.Queue(),
+    )
+    assert channel.agent_id == "test-1"
+    assert channel.original_request == "user request"
+    assert channel.spawn_prompt == "do research"
+    assert channel.max_rounds == 5
+    assert channel.round_count == 0
+    assert channel.history == []
+    assert channel.consumer_task is None
+    assert channel.closed is False
+
+
+def test_channels_registry_exists():
+    """Module-level _channels dict exists."""
+    assert hasattr(subagent_mod, "_channels")
+    assert isinstance(subagent_mod._channels, dict)
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional dialogue — Consumer coroutine
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_dialogue_consumer_resolves_future():
+    """Consumer picks up a question, calls LLM, resolves the Future."""
+    app_state = _make_app_state()
+    app_state.router_client.chat = AsyncMock(return_value={
+        "choices": [{"message": {"content": "The answer is 42"}}],
+    })
+
+    channel = subagent_mod.DialogueChannel(
+        agent_id="cons-1",
+        original_request="original user request",
+        spawn_prompt="research task",
+        to_main=asyncio.Queue(),
+    )
+
+    consumer = asyncio.create_task(
+        subagent_mod._dialogue_consumer(channel, app_state)
+    )
+
+    future = asyncio.get_running_loop().create_future()
+    await channel.to_main.put(("What is the meaning?", future))
+
+    result = await asyncio.wait_for(future, timeout=2.0)
+    assert result == "The answer is 42"
+    assert channel.round_count == 1
+    assert len(channel.history) == 2
+
+    channel.closed = True
+    consumer.cancel()
+    try:
+        await consumer
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_dialogue_consumer_exits_on_cancel():
+    """Consumer coroutine exits cleanly when cancelled."""
+    app_state = _make_app_state()
+    channel = subagent_mod.DialogueChannel(
+        agent_id="cons-2",
+        original_request="req",
+        spawn_prompt="task",
+        to_main=asyncio.Queue(),
+    )
+
+    consumer = asyncio.create_task(
+        subagent_mod._dialogue_consumer(channel, app_state)
+    )
+    await asyncio.sleep(0)
+
+    consumer.cancel()
+    await asyncio.sleep(0)
+    assert consumer.done()
+
+
+@pytest.mark.asyncio
+async def test_dialogue_consumer_resolves_future_on_llm_error():
+    """Consumer resolves Future with error string when LLM call fails."""
+    app_state = _make_app_state()
+    app_state.router_client.chat = AsyncMock(side_effect=RuntimeError("API timeout"))
+
+    channel = subagent_mod.DialogueChannel(
+        agent_id="err-1",
+        original_request="req",
+        spawn_prompt="task",
+        to_main=asyncio.Queue(),
+    )
+
+    consumer = asyncio.create_task(
+        subagent_mod._dialogue_consumer(channel, app_state)
+    )
+
+    future = asyncio.get_running_loop().create_future()
+    await channel.to_main.put(("question?", future))
+
+    result = await asyncio.wait_for(future, timeout=2.0)
+    assert "error" in result.lower()
+    # Consumer should still be alive (not crashed)
+    assert not consumer.done()
+
+    channel.closed = True
+    consumer.cancel()
+    try:
+        await consumer
+    except asyncio.CancelledError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional dialogue — consult_main handler and heartbeat
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_consult_main_rejects_after_max_rounds():
+    """consult_main returns error when round_count >= max_rounds."""
+    channel = subagent_mod.DialogueChannel(
+        agent_id="max-1",
+        original_request="req",
+        spawn_prompt="task",
+        to_main=asyncio.Queue(),
+        round_count=5,
+    )
+    subagent_mod._channels["max-1"] = channel
+
+    result = json.loads(
+        await subagent_mod._handle_consult("max-1", "one more question?")
+    )
+    assert "error" in result
+    assert "limit" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_consult_main_rejects_long_question():
+    """consult_main returns error when question exceeds 2000 chars."""
+    channel = subagent_mod.DialogueChannel(
+        agent_id="long-1",
+        original_request="req",
+        spawn_prompt="task",
+        to_main=asyncio.Queue(),
+    )
+    subagent_mod._channels["long-1"] = channel
+
+    result = json.loads(
+        await subagent_mod._handle_consult("long-1", "x" * 2001)
+    )
+    assert "error" in result
+    assert "2000" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_consult_main_full_roundtrip():
+    """consult_main pushes question, consumer resolves, tool returns answer."""
+    app_state = _make_app_state()
+    app_state.router_client.chat = AsyncMock(return_value={
+        "choices": [{"message": {"content": "Use Redis"}}],
+    })
+
+    agent_id = "rt-1"
+    subagent_mod._agents[agent_id] = {
+        "name": "coder",
+        "status": "running",
+        "last_activity": datetime.now(timezone.utc),
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    channel = subagent_mod.DialogueChannel(
+        agent_id=agent_id,
+        original_request="build caching layer",
+        spawn_prompt="implement cache",
+        to_main=asyncio.Queue(),
+    )
+    channel.consumer_task = asyncio.create_task(
+        subagent_mod._dialogue_consumer(channel, app_state)
+    )
+    subagent_mod._channels[agent_id] = channel
+
+    result = await asyncio.wait_for(
+        subagent_mod._handle_consult(agent_id, "Redis or memcached?"),
+        timeout=2.0,
+    )
+    assert "Use Redis" in result
+
+    channel.closed = True
+    channel.consumer_task.cancel()
+    try:
+        await channel.consumer_task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_consult_heartbeat_updates_last_activity():
+    """_consult_heartbeat updates last_activity periodically."""
+    agent_id = "hb-consult"
+    subagent_mod._agents[agent_id] = {
+        "name": "hb",
+        "status": "running",
+        "last_activity": datetime(2020, 1, 1, tzinfo=timezone.utc),
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    future = asyncio.get_running_loop().create_future()
+
+    with patch.object(subagent_mod, "_CONSULT_HEARTBEAT_INTERVAL", 0.01):
+        asyncio.create_task(
+            subagent_mod._consult_heartbeat(agent_id, future)
+        )
+        await asyncio.sleep(0.05)
+        future.set_result("done")
+        await asyncio.sleep(0.02)
+
+    assert subagent_mod._agents[agent_id]["last_activity"].year > 2020
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional dialogue — Channel cleanup
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cleanup_channel_resolves_pending_future():
+    """_cleanup_channel resolves pending Futures with error string."""
+    channel = subagent_mod.DialogueChannel(
+        agent_id="cleanup-1",
+        original_request="req",
+        spawn_prompt="task",
+        to_main=asyncio.Queue(),
+    )
+    subagent_mod._channels["cleanup-1"] = channel
+
+    future = asyncio.get_running_loop().create_future()
+    await channel.to_main.put(("question", future))
+
+    subagent_mod._cleanup_channel("cleanup-1")
+
+    assert future.done()
+    assert "terminated" in future.result().lower()
+    assert "cleanup-1" not in subagent_mod._channels
+
+
+@pytest.mark.asyncio
+async def test_cleanup_channel_cancels_consumer():
+    """_cleanup_channel cancels the consumer coroutine."""
+    app_state = _make_app_state()
+    channel = subagent_mod.DialogueChannel(
+        agent_id="cleanup-2",
+        original_request="req",
+        spawn_prompt="task",
+        to_main=asyncio.Queue(),
+    )
+    channel.consumer_task = asyncio.create_task(
+        subagent_mod._dialogue_consumer(channel, app_state)
+    )
+    subagent_mod._channels["cleanup-2"] = channel
+
+    await asyncio.sleep(0)
+
+    subagent_mod._cleanup_channel("cleanup-2")
+
+    assert channel.closed is True
+    await asyncio.sleep(0)
+    assert channel.consumer_task.cancelled() or channel.consumer_task.done()
+
+
+@pytest.mark.asyncio
+async def test_on_agent_done_cleans_up_channel():
+    """_on_agent_done triggers _cleanup_channel when agent has a channel."""
+    agent_id = "done-cleanup"
+    channel = subagent_mod.DialogueChannel(
+        agent_id=agent_id,
+        original_request="req",
+        spawn_prompt="task",
+        to_main=asyncio.Queue(),
+    )
+    subagent_mod._channels[agent_id] = channel
+    subagent_mod._agents[agent_id] = {
+        "name": "agent",
+        "status": "running",
+        "group_id": "grp",
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    async def _crash():
+        raise RuntimeError("boom")
+
+    task = asyncio.create_task(_crash(), name=f"agent-{agent_id}")
+    subagent_mod._agents[agent_id]["task"] = task
+    task.add_done_callback(lambda t, aid=agent_id: subagent_mod._on_agent_done(aid, t))
+
+    try:
+        await task
+    except RuntimeError:
+        pass
+    await asyncio.sleep(0)
+
+    assert agent_id not in subagent_mod._channels
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional dialogue — Channel creation in spawn
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_spawn_creates_dialogue_channel():
+    """_handle_spawn creates a DialogueChannel for the spawned agent."""
+    app_state = _make_app_state()
+    app_state.current_request = "user wants research"
+
+    with patch.object(subagent_mod, "_run_agent", side_effect=_noop_run_agent):
+        result = json.loads(
+            await subagent_mod._handle_spawn(
+                app_state, name="researcher", prompt="find info"
+            )
+        )
+
+    agent_id = result["agent_id"]
+    assert agent_id in subagent_mod._channels
+    channel = subagent_mod._channels[agent_id]
+    assert channel.original_request == "user wants research"
+    assert channel.spawn_prompt == "find info"
+    assert channel.consumer_task is not None
+
+    subagent_mod._cleanup_channel(agent_id)
+    await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional dialogue — consult_main tool injection
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_subagent_has_consult_main_tool():
+    """Subagent's tool schemas include consult_main."""
+    app_state = _make_app_state()
+    app_state.current_request = "user request"
+
+    agent_id = "consult-tool-test"
+    subagent_mod._agents[agent_id] = {
+        "name": "tester",
+        "prompt": "test",
+        "status": "starting",
+        "group_id": "grp",
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    captured_tools = []
+
+    async def _capture_tool_loop(*, tools, **kwargs):
+        captured_tools.extend(tools)
+        return ("done", {})
+
+    with patch("spare_paw.router.tool_loop.run_tool_loop", side_effect=_capture_tool_loop):
+        with patch("spare_paw.bot.handler._build_system_prompt", return_value="sys"):
+            await subagent_mod._run_agent(
+                agent_id, "test", app_state,
+                model=None, tools_filter=None, max_iterations=5,
+            )
+
+    tool_names = {t["function"]["name"] for t in captured_tools}
+    assert "consult_main" in tool_names
+
+    if agent_id in subagent_mod._channels:
+        subagent_mod._cleanup_channel(agent_id)
+
+
+def test_consult_main_not_in_global_registry():
+    """consult_main should NOT be in the global tool registry."""
+    from spare_paw.tools.registry import ToolRegistry
+
+    registry = ToolRegistry()
+    app_state = _make_app_state()
+    subagent_mod.register(registry, {}, app_state)
+
+    schema_names = {s["function"]["name"] for s in registry.get_schemas()}
+    assert "consult_main" not in schema_names
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional dialogue — Progress messages during consults
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_consult_updates_progress_message():
+    """Consumer calls _update_progress after resolving a consult."""
+    app_state = _make_app_state()
+    backend = _ProgressBackend()
+    backend.edit_progress = AsyncMock()
+    app_state.backend = backend
+
+    app_state.router_client.chat = AsyncMock(return_value={
+        "choices": [{"message": {"content": "answer"}}],
+    })
+
+    agent_id = "prog-consult"
+    subagent_mod._agents[agent_id] = {
+        "name": "researcher",
+        "status": "running",
+        "progress_message_id": 99,
+        "last_activity": datetime.now(timezone.utc),
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    channel = subagent_mod.DialogueChannel(
+        agent_id=agent_id,
+        original_request="req",
+        spawn_prompt="task",
+        to_main=asyncio.Queue(),
+    )
+    channel.consumer_task = asyncio.create_task(
+        subagent_mod._dialogue_consumer(channel, app_state)
+    )
+    subagent_mod._channels[agent_id] = channel
+
+    future = asyncio.get_running_loop().create_future()
+    await channel.to_main.put(("question?", future))
+    await asyncio.wait_for(future, timeout=2.0)
+
+    backend.edit_progress.assert_called_once()
+    call_args = backend.edit_progress.call_args
+    assert "round" in call_args.args[1].lower()
+
+    channel.closed = True
+    channel.consumer_task.cancel()
+    try:
+        await channel.consumer_task
+    except asyncio.CancelledError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional dialogue — Integration test
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_integration_spawn_consult_complete():
+    """Full cycle: spawn agent → agent consults main → agent completes → group callback."""
+    from spare_paw.tools.registry import ToolRegistry
+
+    app_state = _make_app_state()
+    app_state.current_request = "analyze our API"
+    app_state.router_client.chat = AsyncMock(return_value={
+        "choices": [{"message": {"content": "Focus on p99 latency"}}],
+    })
+
+    registry = ToolRegistry()
+    app_state.tool_registry = registry
+    subagent_mod.register(registry, {}, app_state)
+
+    queue = asyncio.Queue()
+    original_queue = subagent_mod._message_queue
+    subagent_mod._message_queue = queue
+
+    try:
+        async def _consulting_agent(agent_id, prompt, app_state_, *args, **kwargs):
+            subagent_mod._agents[agent_id]["status"] = "running"
+
+            result = await subagent_mod._handle_consult(agent_id, "What should I focus on?")
+            assert "p99" in result.lower() or "latency" in result.lower()
+
+            subagent_mod._agents[agent_id]["status"] = "completed"
+            subagent_mod._agents[agent_id]["result"] = f"Analysis done. Guidance: {result}"
+            subagent_mod._agents[agent_id]["result_preview"] = f"Analysis done. Guidance: {result}"[:200]
+            subagent_mod._agents[agent_id]["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+        with patch.object(subagent_mod, "_run_agent", side_effect=_consulting_agent):
+            await subagent_mod._handle_spawn(
+                app_state, name="analyst", prompt="analyze API latency",
+                agent_type="analyst",
+            )
+
+            await asyncio.sleep(0.1)
+
+        agents = [a for a in subagent_mod._agents.values() if a["name"] == "analyst"]
+        assert len(agents) == 1
+        assert agents[0]["status"] == "completed"
+
+    finally:
+        subagent_mod._message_queue = original_queue
+        for aid in list(subagent_mod._channels):
+            subagent_mod._cleanup_channel(aid)

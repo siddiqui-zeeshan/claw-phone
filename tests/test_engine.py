@@ -59,6 +59,7 @@ def _make_app_state(response_text="Bot response."):
     app_state.config.get = lambda key, default=None: {
         "models.main_agent": "test-model",
         "models.summary": "summary-model",
+        "models.vision": "vision-model",
         "agent.max_tool_iterations": 5,
         "agent.system_prompt": "You are a test bot.",
     }.get(key, default)
@@ -103,6 +104,28 @@ class TestProcessMessage:
         backend.send_text.assert_awaited_once_with("Bot reply")
 
     @pytest.mark.asyncio
+    async def test_sets_current_request_on_app_state(self):
+        """process_message stores msg.text on app_state.current_request."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(text="do something complex")
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="Reply"), \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock):
+            mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
+            mock_ctx.ingest = AsyncMock(return_value="msg-1")
+            mock_ctx.assemble = AsyncMock(return_value=[
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "do something complex"},
+            ])
+
+            await process_message(app_state, msg, backend)
+
+        assert app_state.current_request == "do something complex"
+
+    @pytest.mark.asyncio
     async def test_voice_message(self):
         """Voice message: transcribe bytes, then proceed as text."""
         app_state = _make_app_state()
@@ -127,33 +150,27 @@ class TestProcessMessage:
         backend.send_text.assert_awaited_once_with("Voice reply")
 
     @pytest.mark.asyncio
-    async def test_image_message(self):
-        """Image message: base64 encode, build multimodal content."""
+    async def test_image_message_uses_caption_as_text(self):
+        """Image message: uses caption as text, calls describe_media."""
         app_state = _make_app_state()
         backend = _make_backend()
         msg = IncomingMessage(image_bytes=b"\xff\xd8", caption="what is this?")
 
-        assembled = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "what is this?"},
-        ]
-
         with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
-             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="It's a photo") as _mock_loop, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="It's a photo"), \
              patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
-             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock):
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock), \
+             patch("spare_paw.core.engine.describe_media", new_callable=AsyncMock, return_value="A photo"):
             mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
             mock_ctx.ingest = AsyncMock(return_value="msg-1")
-            mock_ctx.assemble = AsyncMock(return_value=assembled)
+            mock_ctx.assemble = AsyncMock(return_value=[
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "what is this?"},
+            ])
 
             await process_message(app_state, msg, backend)
 
-        # Check that the last user message was made multimodal
-        last_user = assembled[-1]
-        assert isinstance(last_user["content"], list)
-        assert last_user["content"][0]["type"] == "text"
-        assert last_user["content"][1]["type"] == "image_url"
-        assert "base64" in last_user["content"][1]["image_url"]["url"]
+        mock_ctx.ingest.assert_any_await("conv-1", "user", "what is this?")
 
     @pytest.mark.asyncio
     async def test_cron_context_injected(self):
@@ -422,3 +439,109 @@ class TestNoTelegramImport:
                     assert not node.module.startswith("telegram"), (
                         f"Found 'from {node.module}' in core/engine.py"
                     )
+
+
+class TestVisionPreprocessing:
+    @pytest.mark.asyncio
+    async def test_image_calls_describe_media(self):
+        """Image message calls describe_media and appends result as user message."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(image_bytes=b"\xff\xd8", caption="what is this?")
+
+        assembled = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "what is this?"},
+        ]
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="It's a cat"), \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock), \
+             patch("spare_paw.core.engine.describe_media", new_callable=AsyncMock, return_value="A photo of a cat") as mock_describe:
+            mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
+            mock_ctx.ingest = AsyncMock(return_value="msg-1")
+            mock_ctx.assemble = AsyncMock(return_value=assembled)
+
+            await process_message(app_state, msg, backend)
+
+        mock_describe.assert_awaited_once()
+        analysis_msgs = [m for m in assembled if "[Media analysis]" in m.get("content", "")]
+        assert len(analysis_msgs) == 1
+        assert analysis_msgs[0]["role"] == "user"
+        assert "A photo of a cat" in analysis_msgs[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_video_calls_describe_media(self):
+        """Video message calls describe_media with video bytes."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(video_bytes=b"\x00\x00\x00\x1cftyp", caption="what's happening?")
+
+        assembled = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "what's happening?"},
+        ]
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="A dance"), \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock), \
+             patch("spare_paw.core.engine.describe_media", new_callable=AsyncMock, return_value="A person dancing") as mock_describe:
+            mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
+            mock_ctx.ingest = AsyncMock(return_value="msg-1")
+            mock_ctx.assemble = AsyncMock(return_value=assembled)
+
+            await process_message(app_state, msg, backend)
+
+        call_kwargs = mock_describe.call_args.kwargs
+        assert call_kwargs["media_mime"] == "video/mp4"
+
+    @pytest.mark.asyncio
+    async def test_no_media_skips_describe(self):
+        """Text-only message does not call describe_media."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(text="hello")
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="Hi"), \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock), \
+             patch("spare_paw.core.engine.describe_media", new_callable=AsyncMock) as mock_describe:
+            mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
+            mock_ctx.ingest = AsyncMock(return_value="msg-1")
+            mock_ctx.assemble = AsyncMock(return_value=[
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hello"},
+            ])
+
+            await process_message(app_state, msg, backend)
+
+        mock_describe.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_image_no_multimodal_content_on_main_agent(self):
+        """Image message should NOT inject multimodal content blocks for the main agent."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(image_bytes=b"\xff\xd8", caption="what?")
+
+        assembled = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "what?"},
+        ]
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="reply"), \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock), \
+             patch("spare_paw.core.engine.describe_media", new_callable=AsyncMock, return_value="desc"):
+            mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
+            mock_ctx.ingest = AsyncMock(return_value="msg-1")
+            mock_ctx.assemble = AsyncMock(return_value=assembled)
+
+            await process_message(app_state, msg, backend)
+
+        for m in assembled:
+            assert isinstance(m["content"], str), f"Found multimodal content block: {m}"
