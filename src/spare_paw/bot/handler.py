@@ -51,6 +51,14 @@ def setup_handlers(application: "Application") -> None:
     application.add_handler(
         MessageHandler(filters.PHOTO, _queue_message)
     )
+    # Video messages
+    application.add_handler(
+        MessageHandler(filters.VIDEO, _queue_message)
+    )
+    # Video note (circle videos)
+    application.add_handler(
+        MessageHandler(filters.VIDEO_NOTE, _queue_message)
+    )
     # Inline keyboard button callbacks
     application.add_handler(CallbackQueryHandler(_handle_callback))
 
@@ -81,10 +89,16 @@ async def _queue_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if message is None:
         return
 
+    voice_bytes = (await _download_voice(message)) if message.voice else None
+    image_bytes = (await _download_photo(message)) if message.photo else None
+    video_bytes, video_mime = await _download_video(message)
+
     msg = IncomingMessage(
         text=message.text,
-        voice_bytes=(await _download_voice(message)) if message.voice else None,
-        image_bytes=(await _download_photo(message)) if message.photo else None,
+        voice_bytes=voice_bytes,
+        image_bytes=image_bytes,
+        video_bytes=video_bytes,
+        video_mime=video_mime,
         caption=message.caption,
         cron_context=_extract_cron_context(update),
         user_id=update.effective_user.id if update.effective_user else None,
@@ -106,6 +120,33 @@ async def _download_voice(message: Any) -> bytes | None:
     except Exception:
         logger.exception("Failed to download voice message")
         return None
+
+
+async def _download_video(message: Any) -> tuple[bytes | None, str]:
+    """Download video or video_note bytes from Telegram.
+
+    Returns (video_bytes, mime_type). Video notes are always MP4.
+    """
+    if message.video:
+        try:
+            video_file = await message.video.get_file()
+            data = bytes(await video_file.download_as_bytearray())
+            mime = getattr(message.video, "mime_type", "video/mp4") or "video/mp4"
+            return data, mime
+        except Exception:
+            logger.exception("Failed to download video")
+            return None, "video/mp4"
+
+    if message.video_note:
+        try:
+            vn_file = await message.video_note.get_file()
+            data = bytes(await vn_file.download_as_bytearray())
+            return data, "video/mp4"
+        except Exception:
+            logger.exception("Failed to download video note")
+            return None, "video/mp4"
+
+    return None, "video/mp4"
 
 
 async def _download_photo(message: Any) -> bytes | None:
