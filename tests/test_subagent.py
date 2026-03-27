@@ -18,10 +18,12 @@ import spare_paw.tools.subagent as subagent_mod
 
 @pytest.fixture(autouse=True)
 def _reset_agents():
-    """Clear the global _agents dict before each test."""
+    """Clear the global _agents and _channels dicts before each test."""
     subagent_mod._agents.clear()
+    subagent_mod._channels.clear()
     yield
     subagent_mod._agents.clear()
+    subagent_mod._channels.clear()
 
 
 def _make_app_state() -> MagicMock:
@@ -869,3 +871,31 @@ async def test_tool_loop_to_spawn_handler_integration():
 
     # Let background tasks finish
     await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional dialogue — DialogueChannel
+# ---------------------------------------------------------------------------
+
+def test_dialogue_channel_dataclass_exists():
+    """DialogueChannel dataclass has expected fields."""
+    channel = subagent_mod.DialogueChannel(
+        agent_id="test-1",
+        original_request="user request",
+        spawn_prompt="do research",
+        to_main=asyncio.Queue(),
+    )
+    assert channel.agent_id == "test-1"
+    assert channel.original_request == "user request"
+    assert channel.spawn_prompt == "do research"
+    assert channel.max_rounds == 5
+    assert channel.round_count == 0
+    assert channel.history == []
+    assert channel.consumer_task is None
+    assert channel.closed is False
+
+
+def test_channels_registry_exists():
+    """Module-level _channels dict exists."""
+    assert hasattr(subagent_mod, "_channels")
+    assert isinstance(subagent_mod._channels, dict)
