@@ -8,7 +8,6 @@ to the MessageBackend.
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -18,6 +17,7 @@ from spare_paw.config import resolve_model
 from spare_paw.context import compact_with_retry
 from spare_paw.core.planner import create_plan
 from spare_paw.core.prompt import build_system_prompt
+from spare_paw.core.vision import describe_media
 from spare_paw.core.voice import VoiceTranscriptionError, transcribe
 from spare_paw.router.tool_loop import run_tool_loop
 
@@ -74,7 +74,7 @@ async def process_message(
 
     # 1. Determine text content
     text = msg.text
-    image_url = None
+    media_description = None
 
     if msg.voice_bytes:
         try:
@@ -84,10 +84,21 @@ async def process_message(
             logger.exception("Voice transcription failed")
             return
 
-    if msg.image_bytes:
-        b64 = base64.b64encode(msg.image_bytes).decode("ascii")
-        image_url = f"data:{msg.image_mime};base64,{b64}"
-        text = msg.caption or "What do you see in this image?"
+    # 2. Vision preprocessing for images/videos
+    media_bytes = msg.image_bytes or msg.video_bytes
+    if media_bytes:
+        media_mime = msg.video_mime if msg.video_bytes else msg.image_mime
+        user_text = msg.text or msg.caption
+        vision_model = resolve_model(app_state.config, "vision")
+        media_description = await describe_media(
+            client=app_state.router_client,
+            media_bytes=media_bytes,
+            media_mime=media_mime,
+            user_text=user_text,
+            model=vision_model,
+        )
+        if not text:
+            text = msg.caption or "Sent media"
 
     if not text:
         return
@@ -105,15 +116,12 @@ async def process_message(
     system_prompt = await build_system_prompt(app_state.config)
     messages = await ctx.assemble(conversation_id, system_prompt)
 
-    # 5. Image: make last user message multimodal
-    if image_url and messages:
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i]["role"] == "user":
-                messages[i]["content"] = [
-                    {"type": "text", "text": text},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ]
-                break
+    # 5. Inject media description
+    if media_description:
+        messages.append({
+            "role": "user",
+            "content": f"[Media analysis]: {media_description}",
+        })
 
     # 6. Cron context injection
     if msg.cron_context:
