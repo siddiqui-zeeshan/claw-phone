@@ -1,14 +1,14 @@
 # spare-paw
 
-A 24/7 personal AI agent accessible through Telegram. Runs on macOS, Linux, Windows, Android (Termux), or Docker. Features role-based model selection via OpenRouter (7 roles with fallback chain), DAG-based lossless context management, shell and filesystem tools, scheduled tasks, voice transcription, and full-text search over conversation history. Cold starts in ~1 second.
+A 24/7 personal AI agent accessible through Telegram. Runs on macOS, Linux, Windows, Android (Termux), or Docker. Features role-based model selection via OpenRouter (8 roles with fallback chain), DAG-based lossless context management, shell and filesystem tools, scheduled tasks, voice transcription, video preprocessing, and full-text search over conversation history. Cold starts in ~1 second.
 
 ## Features
 
-- **Role-based model selection** -- 7 model roles (main_agent, coder, planner, cron, researcher, analyst, summary) each independently configurable via OpenRouter; fallback chain: role-specific model -> main_agent -> google/gemini-2.0-flash
+- **Role-based model selection** -- 8 model roles (main_agent, coder, planner, cron, researcher, analyst, summary, vision) each independently configurable via OpenRouter; fallback chain: role-specific model -> main_agent -> google/gemini-2.0-flash
 - **Tool use** -- shell commands, file operations, web search, web scraping, cron management; all exposed as LLM function calls
 - **Scheduled tasks (cron)** -- create, edit, pause, resume, and manage recurring AI tasks with per-cron model selection
 - **One-shot reminders** -- ask the bot to remind you of something in X minutes/hours; it creates a cron that fires once and auto-deletes itself (e.g. "remind me to call John in 30 minutes")
-- **Photo/image support** -- send photos via Telegram; they are base64-encoded and forwarded to the model as multimodal vision messages. Caption is used as the prompt (defaults to "What do you see in this image?")
+- **Photo/image and video support** -- send photos and videos via Telegram; images and videos are preprocessed through a vision-capable model (configurable via `models.vision`, defaults to `google/gemini-3.1-flash-lite-preview`) to generate text descriptions. The main agent receives text summaries instead of raw media, reducing token costs while preserving semantic content. Captions are used as the prompt (defaults to "What do you see in this image/video?")
 - **Voice messages** -- Groq Whisper transcription for Telegram voice notes
 - **Prompt files** -- loads `IDENTITY.md`, `USER.md`, and `SYSTEM.md` from `~/.spare-paw/` on every turn for personality, user preferences, and device context. Editable live without restart
 - **Full-text search** -- FTS5-backed search across all conversation history
@@ -19,6 +19,7 @@ A 24/7 personal AI agent accessible through Telegram. Runs on macOS, Linux, Wind
 - **Heartbeat watchdog** -- detects event loop starvation and deadlocks, not just process crashes
 - **Deep thinking (`/plan`)** -- on-demand planning phase that decomposes complex requests into a structured execution plan before the tool loop runs. A single cheap LLM call (no tools) produces a step-by-step plan with tool/agent classification and parallelism hints; the plan is injected as context for the main model to follow. Regular messages skip planning entirely (zero overhead)
 - **Agent orchestration** -- spawn multiple subagents in a single turn; agents spawned in the same tool-call batch are deterministically grouped (via a shared batch group_id injected by the tool loop) and their results are delivered together as one synthesized response. Three predefined archetypes: `researcher` (web search + scraping), `coder` (shell + files), `analyst` (data analysis), each with preset tools and system prompt. Safety limits: max 3 concurrent agents, max 3 per group
+- **Bidirectional agent dialogue** -- subagents can consult the main agent for clarification or decision-making via the `consult_main` tool. Supports up to 5 rounds of back-and-forth within a single spawn, enabling complex collaborative workflows where agents ask questions before proceeding with their work
 - **Token/cost tracking** -- per-agent token usage tracking (prompt, completion, total) from OpenRouter, visible via `list_agents`
 - **MCP client** -- connect to external MCP servers (GitHub, filesystem, etc.) and use their tools alongside native tools
 - **Owner-only auth** -- all messages from non-owner Telegram users are silently ignored
@@ -115,7 +116,7 @@ A template is provided at `config.example.yaml`. Key sections:
 | `webhook` | Port, optional secret, and `enabled` flag for the HTTP webhook backend |
 | `remote` | `url` and `secret` for `spare-paw chat` to reach a remote instance |
 | `openrouter` | OpenRouter API key |
-| `models` | Role-based model assignments: `main_agent`, `coder`, `planner`, `cron`, `researcher`, `analyst`, `summary` |
+| `models` | Role-based model assignments: `main_agent`, `coder`, `planner`, `cron`, `researcher`, `analyst`, `summary`, `vision` |
 | `groq` | Groq API key for voice transcription |
 | `tavily` | Tavily API key for web search |
 | `context` | `max_messages`, `token_budget`, `safety_margin`, `fresh_tail_count`, `leaf_chunk_size`, `condensed_min_fanout` |
@@ -128,13 +129,14 @@ Role-based model configuration:
 
 ```yaml
 models:
-  main_agent: "google/gemini-2.0-flash"       # primary model for conversations
-  coder: "google/gemini-2.5-pro"               # used by coder subagents
-  planner: "anthropic/claude-sonnet-4"         # used by /plan deep thinking
-  cron: "google/gemini-2.0-flash"              # used for cron job execution
-  researcher: "google/gemini-2.0-flash"        # used by researcher subagents
-  analyst: "google/gemini-2.0-flash"           # used by analyst subagents
-  summary: "google/gemini-3.1-flash-lite"      # used for LCM context summaries
+  main_agent: "google/gemini-2.0-flash"              # primary model for conversations
+  coder: "google/gemini-2.5-pro"                     # used by coder subagents
+  planner: "anthropic/claude-sonnet-4"               # used by /plan deep thinking
+  cron: "google/gemini-2.0-flash"                    # used for cron job execution
+  researcher: "google/gemini-2.0-flash"              # used by researcher subagents
+  analyst: "google/gemini-2.0-flash"                 # used by analyst subagents
+  summary: "google/gemini-3.1-flash-lite"            # used for LCM context summaries
+  vision: "google/gemini-3.1-flash-lite-preview"     # used for image/video preprocessing
 ```
 
 Each role falls back through the chain: role-specific model -> `main_agent` -> `google/gemini-2.0-flash`. You only need to set the roles you want to override.
@@ -296,6 +298,7 @@ All tools are exposed to the LLM as callable functions. Blocking tools run in a 
 | `cron_edit` | Edit an existing scheduled task | Update name, schedule, prompt, and/or model by cron ID |
 | `cron_delete` | Delete a scheduled task | By cron ID |
 | `spawn_agent` | Spawn a subagent for parallel work | `agent_type`: `researcher`, `coder`, or `analyst`; multiple can be spawned in one turn and are auto-grouped |
+| `consult_main` | Ask the main agent for clarification | Available within subagents; enables bidirectional dialogue with up to 5 rounds |
 | `list_agents` | List running/completed agents | Shows status, result preview, and per-agent token usage (prompt, completion, total) |
 | `cron_list` | List all scheduled tasks | Returns schedule, status, last run info |
 | `lcm_grep` | Search raw messages and compressed summaries | FTS5 full-text search across history and DAG summaries |
