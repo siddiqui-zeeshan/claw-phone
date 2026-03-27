@@ -15,14 +15,32 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from dataclasses import dataclass, field
+
 from spare_paw.config import resolve_model
 
 logger = logging.getLogger(__name__)
 
 # Active and completed agents
 _agents: dict[str, dict[str, Any]] = {}
-_MAX_CONCURRENT = 3
-_MAX_PER_GROUP = 3  # max agents in a single group/batch
+_MAX_CONCURRENT = 10
+_MAX_PER_GROUP = 5  # max agents in a single group/batch
+
+@dataclass
+class DialogueChannel:
+    agent_id: str
+    original_request: str
+    spawn_prompt: str
+    to_main: asyncio.Queue
+    max_rounds: int = 5
+    round_count: int = 0
+    history: list[dict] = field(default_factory=list)
+    consumer_task: asyncio.Task | None = None
+    closed: bool = False
+
+
+# Active dialogue channels keyed by agent_id
+_channels: dict[str, DialogueChannel] = {}
 
 # Reference to the message queue — set by engine.py at startup
 _message_queue: asyncio.Queue | None = None
