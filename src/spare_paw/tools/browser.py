@@ -316,11 +316,19 @@ async def _handle_type(selector: str, text: str, clear: bool = True) -> str:
         return json.dumps({"error": f"type failed: {e}"})
 
 
-async def _handle_screenshot() -> str:
+async def _handle_screenshot(full_page: bool = False) -> str:
     try:
         session = await _ensure_session()
+        params: dict[str, Any] = {"format": "png"}
+        if full_page:
+            # Get full page dimensions and set clip
+            metrics = await session.send("Page.getLayoutMetrics")
+            content = metrics.get("contentSize", {})
+            width = content.get("width", 1280)
+            height = content.get("height", 720)
+            params["clip"] = {"x": 0, "y": 0, "width": width, "height": height, "scale": 1}
         result = await session.send(
-            "Page.captureScreenshot", {"format": "png"}
+            "Page.captureScreenshot", params
         )
         data = base64.b64decode(result["data"])
 
@@ -439,6 +447,113 @@ async def _handle_wait(selector: str, timeout: int = 10) -> str:
         return json.dumps({"error": f"wait failed: {e}"})
 
 
+async def _handle_select(selector: str, value: str | None = None, label: str | None = None) -> str:
+    try:
+        session = await _ensure_session()
+        if value is not None:
+            match_expr = f"opt.value === {json.dumps(value)}"
+            match_desc = f"value={value}"
+        elif label is not None:
+            match_expr = f"opt.textContent.trim() === {json.dumps(label)}"
+            match_desc = f"label={label}"
+        else:
+            return json.dumps({"error": "Provide either 'value' or 'label'"})
+
+        result = await session.send(
+            "Runtime.evaluate",
+            {
+                "expression": f"""
+                    (() => {{
+                        const el = document.querySelector({json.dumps(selector)});
+                        if (!el || el.tagName !== 'SELECT') return {{found: false, reason: 'not a <select>'}};
+                        const opts = Array.from(el.options);
+                        const opt = opts.find(opt => {match_expr});
+                        if (!opt) return {{found: true, matched: false, options: opts.slice(0, 20).map(o => ({{value: o.value, label: o.textContent.trim()}})) }};
+                        el.value = opt.value;
+                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return {{found: true, matched: true, selected: {{value: opt.value, label: opt.textContent.trim()}}}};
+                    }})()
+                """,
+                "returnByValue": True,
+            },
+        )
+        val = result.get("result", {}).get("value", {})
+        if not val.get("found"):
+            return json.dumps({"error": f"Element not found or not a <select>: {selector}"})
+        if not val.get("matched"):
+            return json.dumps({
+                "error": f"No option matching {match_desc}",
+                "available_options": val.get("options", []),
+            })
+        return json.dumps({"selector": selector, "selected": val["selected"]})
+    except Exception as e:
+        return json.dumps({"error": f"select failed: {e}"})
+
+
+async def _handle_scroll(direction: str = "down", amount: int = 500, selector: str | None = None) -> str:
+    try:
+        session = await _ensure_session()
+        if selector:
+            expr = f"""
+                (() => {{
+                    const el = document.querySelector({json.dumps(selector)});
+                    if (!el) return {{found: false}};
+                    el.scrollBy(0, {amount if direction == 'down' else -amount});
+                    return {{found: true, scrollTop: el.scrollTop}};
+                }})()
+            """
+        else:
+            pixels = amount if direction == "down" else -amount
+            expr = f"""
+                (() => {{
+                    window.scrollBy(0, {pixels});
+                    return {{scrollY: window.scrollY, scrollHeight: document.body.scrollHeight, innerHeight: window.innerHeight}};
+                }})()
+            """
+        result = await session.send(
+            "Runtime.evaluate", {"expression": expr, "returnByValue": True}
+        )
+        val = result.get("result", {}).get("value", {})
+        if selector and not val.get("found"):
+            return json.dumps({"error": f"Element not found: {selector}"})
+        return json.dumps({"scrolled": direction, "amount": amount, **val})
+    except Exception as e:
+        return json.dumps({"error": f"scroll failed: {e}"})
+
+
+async def _handle_back() -> str:
+    try:
+        session = await _ensure_session()
+        history = await session.send(
+            "Runtime.evaluate",
+            {"expression": "window.history.length", "returnByValue": True},
+        )
+        length = history.get("result", {}).get("value", 0)
+        if length <= 1:
+            return json.dumps({"error": "No history to go back to"})
+
+        await session.send(
+            "Runtime.evaluate", {"expression": "window.history.back()"}
+        )
+        await asyncio.sleep(1.5)
+
+        title = await session.send(
+            "Runtime.evaluate",
+            {"expression": "document.title", "returnByValue": True},
+        )
+        url = await session.send(
+            "Runtime.evaluate",
+            {"expression": "window.location.href", "returnByValue": True},
+        )
+        return json.dumps({
+            "action": "back",
+            "url": url.get("result", {}).get("value", ""),
+            "title": title.get("result", {}).get("value", ""),
+        })
+    except Exception as e:
+        return json.dumps({"error": f"back failed: {e}"})
+
+
 # -- Shutdown --------------------------------------------------------------
 
 async def shutdown() -> None:
@@ -493,7 +608,13 @@ _TYPE_SCHEMA: dict[str, Any] = {
 
 _SCREENSHOT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {},
+    "properties": {
+        "full_page": {
+            "type": "boolean",
+            "description": "Capture the entire page, not just the visible viewport (default: false)",
+            "default": False,
+        },
+    },
 }
 
 _GET_TEXT_SCHEMA: dict[str, Any] = {
@@ -542,6 +663,51 @@ _WAIT_SCHEMA: dict[str, Any] = {
         },
     },
     "required": ["selector"],
+}
+
+_SELECT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "selector": {
+            "type": "string",
+            "description": "CSS selector of the <select> element",
+        },
+        "value": {
+            "type": "string",
+            "description": "Option value to select (use this or label, not both)",
+        },
+        "label": {
+            "type": "string",
+            "description": "Visible text of the option to select (use this or value, not both)",
+        },
+    },
+    "required": ["selector"],
+}
+
+_SCROLL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "direction": {
+            "type": "string",
+            "enum": ["down", "up"],
+            "description": "Scroll direction (default: down)",
+            "default": "down",
+        },
+        "amount": {
+            "type": "integer",
+            "description": "Pixels to scroll (default: 500)",
+            "default": 500,
+        },
+        "selector": {
+            "type": "string",
+            "description": "Optional CSS selector of a scrollable container. If omitted, scrolls the page.",
+        },
+    },
+}
+
+_BACK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
 }
 
 _TOOLS = [
@@ -596,6 +762,25 @@ _TOOLS = [
         "Use after navigation or clicks that trigger dynamic content loading.",
         _WAIT_SCHEMA,
         _handle_wait,
+    ),
+    (
+        "browser_select",
+        "Select an option from a <select> dropdown by value or visible label. "
+        "Returns available options if no match is found.",
+        _SELECT_SCHEMA,
+        _handle_select,
+    ),
+    (
+        "browser_scroll",
+        "Scroll the page or a specific container. Use to load lazy content or reach elements below the fold.",
+        _SCROLL_SCHEMA,
+        _handle_scroll,
+    ),
+    (
+        "browser_back",
+        "Go back to the previous page in browser history.",
+        _BACK_SCHEMA,
+        _handle_back,
     ),
 ]
 

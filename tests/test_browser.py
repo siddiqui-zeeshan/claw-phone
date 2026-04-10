@@ -9,12 +9,15 @@ import pytest
 
 from spare_paw.tools.browser import (
     BrowserSession,
+    _handle_back,
     _handle_click,
     _handle_eval_js,
     _handle_get_elements,
     _handle_get_text,
     _handle_navigate,
     _handle_screenshot,
+    _handle_scroll,
+    _handle_select,
     _handle_type,
     _handle_wait,
     register,
@@ -284,6 +287,114 @@ class TestWait:
         assert "Timeout" in result["error"]
 
 
+# -- Select ----------------------------------------------------------------
+
+
+class TestSelect:
+    @pytest.mark.asyncio
+    async def test_select_by_value(self):
+        mock_session = _make_session_mock()
+        mock_session.send.return_value = {
+            "result": {"value": {"found": True, "matched": True, "selected": {"value": "us", "label": "United States"}}}
+        }
+
+        with patch("spare_paw.tools.browser._ensure_session", return_value=mock_session):
+            result = json.loads(await _handle_select("select#country", value="us"))
+
+        assert result["selected"]["value"] == "us"
+
+    @pytest.mark.asyncio
+    async def test_select_by_label(self):
+        mock_session = _make_session_mock()
+        mock_session.send.return_value = {
+            "result": {"value": {"found": True, "matched": True, "selected": {"value": "in", "label": "India"}}}
+        }
+
+        with patch("spare_paw.tools.browser._ensure_session", return_value=mock_session):
+            result = json.loads(await _handle_select("select#country", label="India"))
+
+        assert result["selected"]["label"] == "India"
+
+    @pytest.mark.asyncio
+    async def test_select_no_match_returns_options(self):
+        mock_session = _make_session_mock()
+        mock_session.send.return_value = {
+            "result": {"value": {"found": True, "matched": False, "options": [{"value": "a", "label": "A"}]}}
+        }
+
+        with patch("spare_paw.tools.browser._ensure_session", return_value=mock_session):
+            result = json.loads(await _handle_select("select#x", value="z"))
+
+        assert "error" in result
+        assert len(result["available_options"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_select_no_value_or_label(self):
+        result = json.loads(await _handle_select("select#x"))
+        assert "error" in result
+
+
+# -- Scroll ----------------------------------------------------------------
+
+
+class TestScroll:
+    @pytest.mark.asyncio
+    async def test_scroll_down(self):
+        mock_session = _make_session_mock()
+        mock_session.send.return_value = {
+            "result": {"value": {"scrollY": 500, "scrollHeight": 3000, "innerHeight": 720}}
+        }
+
+        with patch("spare_paw.tools.browser._ensure_session", return_value=mock_session):
+            result = json.loads(await _handle_scroll(direction="down", amount=500))
+
+        assert result["scrolled"] == "down"
+        assert result["amount"] == 500
+
+    @pytest.mark.asyncio
+    async def test_scroll_container_not_found(self):
+        mock_session = _make_session_mock()
+        mock_session.send.return_value = {
+            "result": {"value": {"found": False}}
+        }
+
+        with patch("spare_paw.tools.browser._ensure_session", return_value=mock_session):
+            result = json.loads(await _handle_scroll(selector="div.missing"))
+
+        assert "error" in result
+
+
+# -- Back ------------------------------------------------------------------
+
+
+class TestBack:
+    @pytest.mark.asyncio
+    async def test_back_success(self):
+        mock_session = _make_session_mock()
+        mock_session.send.side_effect = [
+            {"result": {"value": 3}},  # history.length
+            {},  # history.back()
+            {"result": {"value": "Previous Page"}},  # title
+            {"result": {"value": "https://example.com/prev"}},  # url
+        ]
+
+        with patch("spare_paw.tools.browser._ensure_session", return_value=mock_session):
+            result = json.loads(await _handle_back())
+
+        assert result["action"] == "back"
+        assert result["title"] == "Previous Page"
+
+    @pytest.mark.asyncio
+    async def test_back_no_history(self):
+        mock_session = _make_session_mock()
+        mock_session.send.return_value = {"result": {"value": 1}}
+
+        with patch("spare_paw.tools.browser._ensure_session", return_value=mock_session):
+            result = json.loads(await _handle_back())
+
+        assert "error" in result
+
+
 # -- Registration ----------------------------------------------------------
 
 
@@ -303,6 +414,9 @@ class TestRegistration:
             "browser_eval_js",
             "browser_get_elements",
             "browser_wait",
+            "browser_select",
+            "browser_scroll",
+            "browser_back",
         }
         registered = {name for name in expected if name in registry}
         assert registered == expected
