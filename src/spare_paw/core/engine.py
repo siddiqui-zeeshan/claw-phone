@@ -206,9 +206,11 @@ async def process_agent_callback(
 
         augmented_text = (
             f"{synthetic_text}\n\n"
-            "[INSTRUCTIONS] The above are results from background agents you spawned. "
-            "Present the FULL findings to the user — include all details, data, links, "
-            "and comparisons the agents found. Do NOT summarize into a single sentence. "
+            "[INSTRUCTIONS] The above are structured results from background agents you spawned.\n"
+            "- If all agents returned status 'complete': present the FULL findings to the user "
+            "— include all details, data, links, and comparisons. Do NOT summarize into a single sentence.\n"
+            "- If any agent returned NEEDS_INFO: ask the user the agent's question before presenting partial results.\n"
+            "- If any agent FAILED: report the failure honestly, then try a different approach or ask the user.\n"
             "Format the response clearly."
         )
         await ctx.ingest(conversation_id, "user", augmented_text)
