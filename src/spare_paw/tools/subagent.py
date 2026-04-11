@@ -154,6 +154,30 @@ def _cleanup_channel(agent_id: str) -> None:
     del _channels[agent_id]
 
 
+_VALID_STATUSES = {"complete", "needs_info", "failed"}
+
+
+def parse_agent_result(raw: str) -> dict[str, Any]:
+    """Parse structured JSON from a subagent result, with fallback for freeform text."""
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("not a dict")
+        if data.get("status") not in _VALID_STATUSES:
+            raise ValueError("invalid status")
+    except (json.JSONDecodeError, ValueError):
+        return {
+            "status": "complete",
+            "summary": raw[:200],
+            "findings": [raw],
+            "sources": [],
+        }
+    data.setdefault("summary", "")
+    data.setdefault("findings", [])
+    data.setdefault("sources", [])
+    return data
+
+
 _CONSULT_HEARTBEAT_INTERVAL = 15  # seconds
 
 

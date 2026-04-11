@@ -1366,3 +1366,71 @@ async def test_integration_spawn_consult_complete():
         subagent_mod._message_queue = original_queue
         for aid in list(subagent_mod._channels):
             subagent_mod._cleanup_channel(aid)
+
+
+# ---------------------------------------------------------------------------
+# Structured result parsing
+# ---------------------------------------------------------------------------
+
+class TestParseAgentResult:
+    def test_valid_complete_json(self):
+        raw = json.dumps({
+            "status": "complete",
+            "summary": "Found 3 results",
+            "findings": ["A", "B", "C"],
+            "sources": ["https://example.com"],
+        })
+        result = subagent_mod.parse_agent_result(raw)
+        assert result["status"] == "complete"
+        assert result["summary"] == "Found 3 results"
+        assert result["findings"] == ["A", "B", "C"]
+        assert result["sources"] == ["https://example.com"]
+
+    def test_valid_needs_info_json(self):
+        raw = json.dumps({
+            "status": "needs_info",
+            "summary": "Need clarification",
+            "question": "Direct flights only?",
+        })
+        result = subagent_mod.parse_agent_result(raw)
+        assert result["status"] == "needs_info"
+        assert result["question"] == "Direct flights only?"
+
+    def test_valid_failed_json(self):
+        raw = json.dumps({
+            "status": "failed",
+            "summary": "Could not access site",
+            "error": "Connection timeout",
+        })
+        result = subagent_mod.parse_agent_result(raw)
+        assert result["status"] == "failed"
+        assert result["error"] == "Connection timeout"
+
+    def test_minimal_json_only_required_fields(self):
+        raw = json.dumps({"status": "complete", "summary": "Done"})
+        result = subagent_mod.parse_agent_result(raw)
+        assert result["status"] == "complete"
+        assert result["findings"] == []
+        assert result["sources"] == []
+
+    def test_invalid_json_falls_back(self):
+        raw = "Here are my findings: the sky is blue."
+        result = subagent_mod.parse_agent_result(raw)
+        assert result["status"] == "complete"
+        assert "the sky is blue" in result["summary"]
+        assert raw in result["findings"][0]
+
+    def test_json_missing_status_falls_back(self):
+        raw = json.dumps({"summary": "no status"})
+        result = subagent_mod.parse_agent_result(raw)
+        assert result["status"] == "complete"
+
+    def test_json_unknown_status_falls_back(self):
+        raw = json.dumps({"status": "banana", "summary": "bad status"})
+        result = subagent_mod.parse_agent_result(raw)
+        assert result["status"] == "complete"
+
+    def test_long_freeform_truncates_summary(self):
+        raw = "x" * 500
+        result = subagent_mod.parse_agent_result(raw)
+        assert len(result["summary"]) <= 200
