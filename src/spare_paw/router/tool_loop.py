@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
@@ -54,6 +56,9 @@ async def run_tool_loop(
     tool_limits: dict[str, int | None] | None = None,
     on_event: Callable[[ToolEvent], None] | None = None,
     on_token: Callable[[str], None] | None = None,
+    tool_timeout: float = 60.0,
+    llm_timeout: float = 120.0,
+    token_budget: int = 0,
 ) -> str | tuple[str, dict[str, int]]:
     """Run the model in a tool-calling loop until it produces a final text response.
 
@@ -79,6 +84,12 @@ async def run_tool_loop(
         tool_limits: Per-tool call limits for this turn. Merged on top of
             ``DEFAULT_TOOL_LIMITS``; set a value to override a default, or
             ``None`` to remove a default limit (making the tool unlimited).
+        tool_timeout: Wall-clock timeout in seconds for each tool execution
+            (default 60s). Prevents hung tools from blocking the loop.
+        llm_timeout: Wall-clock timeout in seconds for each LLM API call
+            (default 120s). Prevents stuck API calls.
+        token_budget: Maximum cumulative tokens for the entire loop. 0 means
+            no limit. When exceeded, the loop aborts with a message.
 
     Returns:
         The final text content from the model when ``track_usage`` is False.
@@ -109,19 +120,47 @@ async def run_tool_loop(
         return text
 
     for iteration in range(1, max_iterations + 1):
+        # Token budget circuit breaker
+        if token_budget > 0 and total_usage["total_tokens"] >= token_budget:
+            logger.warning(
+                "Token budget exceeded (%d/%d) at iteration %d, aborting loop",
+                total_usage["total_tokens"],
+                token_budget,
+                iteration,
+            )
+            return _maybe_with_usage(
+                f"Stopped: token budget exceeded ({total_usage['total_tokens']:,}/{token_budget:,} tokens). "
+                "Try a simpler approach or break the task into smaller steps."
+            )
+
         if on_event is not None:
             on_event(ToolEvent(kind="llm_start", iteration=iteration))
 
-        response = await client.chat(messages, model, tools)
+        # LLM call with timeout
+        try:
+            response = await asyncio.wait_for(
+                client.chat(messages, model, tools),
+                timeout=llm_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Iteration %d: LLM call timed out after %.0fs",
+                iteration, llm_timeout,
+            )
+            return _maybe_with_usage(
+                f"LLM call timed out after {llm_timeout:.0f}s. Try again."
+            )
+
         _accumulate_usage(response)
         usage = response.get("usage", {})
         if usage:
             logger.info(
-                "Iteration %d: tokens prompt=%d completion=%d total=%d",
+                "Iteration %d: tokens prompt=%d completion=%d total=%d cumulative=%d",
                 iteration,
                 usage.get("prompt_tokens", 0),
                 usage.get("completion_tokens", 0),
                 usage.get("total_tokens", 0),
+                total_usage["total_tokens"],
             )
 
         if on_event is not None:
@@ -208,21 +247,33 @@ async def run_tool_loop(
                     iteration=iteration,
                 ))
 
-            # Execute the tool, catching any exception
+            # Execute the tool with timeout, catching any exception
+            t0 = time.monotonic()
             try:
-                result = await tool_registry.execute(name, args, executor)
+                result = await asyncio.wait_for(
+                    tool_registry.execute(name, args, executor),
+                    timeout=tool_timeout,
+                )
                 result_str = str(result) if not isinstance(result, str) else result
+                duration_ms = (time.monotonic() - t0) * 1000
                 preview = result_str[:200] + "..." if len(result_str) > 200 else result_str
                 logger.info(
-                    "Iteration %d: tool %s executed successfully: %s", iteration, name, preview
+                    "Iteration %d: tool %s executed in %.0fms: %s",
+                    iteration, name, duration_ms, preview,
+                )
+            except asyncio.TimeoutError:
+                duration_ms = (time.monotonic() - t0) * 1000
+                result_str = f"Error: tool {name} timed out after {tool_timeout:.0f}s"
+                logger.error(
+                    "Iteration %d: tool %s timed out after %.0fms",
+                    iteration, name, duration_ms,
                 )
             except Exception as exc:
+                duration_ms = (time.monotonic() - t0) * 1000
                 result_str = f"Error executing tool {name}: {exc}"
                 logger.error(
-                    "Iteration %d: tool %s failed: %s",
-                    iteration,
-                    name,
-                    exc,
+                    "Iteration %d: tool %s failed in %.0fms: %s",
+                    iteration, name, duration_ms, exc,
                     exc_info=True,
                 )
 
