@@ -101,6 +101,82 @@ class TestBuildSystemPrompt:
         assert "Search the web thoroughly." in result
 
 
+class TestBuildSubagentPrompt:
+    @pytest.mark.asyncio
+    async def test_includes_current_time(self):
+        """Subagent prompt includes current UTC time."""
+        from spare_paw.core.prompt import build_subagent_prompt
+
+        result = await build_subagent_prompt(suffix="You are a researcher.")
+        assert "Current time:" in result
+        assert "UTC" in result
+
+    @pytest.mark.asyncio
+    async def test_includes_suffix(self):
+        """Subagent prompt includes the type-specific suffix."""
+        from spare_paw.core.prompt import build_subagent_prompt
+
+        result = await build_subagent_prompt(suffix="You are a researcher.")
+        assert "You are a researcher." in result
+
+    @pytest.mark.asyncio
+    async def test_no_suffix(self):
+        """Works without a suffix."""
+        from spare_paw.core.prompt import build_subagent_prompt
+
+        result = await build_subagent_prompt()
+        assert "Current time:" in result
+
+    @pytest.mark.asyncio
+    async def test_includes_timezone(self, tmp_path):
+        """Includes user timezone from USER.md if available."""
+        from spare_paw.core.prompt import build_subagent_prompt
+
+        (tmp_path / "USER.md").write_text("# User\n\nTimezone: Asia/Kolkata (IST)")
+
+        with patch("spare_paw.core.prompt._PROMPT_DIR", tmp_path):
+            result = await build_subagent_prompt(suffix="Research agent.")
+
+        assert "Asia/Kolkata" in result
+
+    @pytest.mark.asyncio
+    async def test_excludes_identity(self, tmp_path):
+        """Does NOT include IDENTITY.md content."""
+        from spare_paw.core.prompt import build_subagent_prompt
+
+        (tmp_path / "IDENTITY.md").write_text("I am SparePaw, a friendly bot.")
+        (tmp_path / "USER.md").write_text("Timezone: Asia/Kolkata")
+
+        with patch("spare_paw.core.prompt._PROMPT_DIR", tmp_path):
+            result = await build_subagent_prompt()
+
+        assert "SparePaw" not in result
+
+    @pytest.mark.asyncio
+    async def test_excludes_system(self, tmp_path):
+        """Does NOT include SYSTEM.md content."""
+        from spare_paw.core.prompt import build_subagent_prompt
+
+        (tmp_path / "SYSTEM.md").write_text("HP t620 thin client with 8GB RAM")
+
+        with patch("spare_paw.core.prompt._PROMPT_DIR", tmp_path):
+            result = await build_subagent_prompt()
+
+        assert "HP t620" not in result
+
+    @pytest.mark.asyncio
+    async def test_excludes_memories(self, tmp_path):
+        """Does NOT load memories."""
+        from spare_paw.core.prompt import build_subagent_prompt
+
+        with patch("spare_paw.core.prompt._PROMPT_DIR", tmp_path), \
+             patch(_MEMORY_PATCH, new_callable=AsyncMock, return_value=[{"key": "secret", "value": "data"}]) as mock_mem:
+            result = await build_subagent_prompt()
+
+        mock_mem.assert_not_called()
+        assert "secret" not in result
+
+
 class TestLeafModuleInvariant:
     """core/prompt.py must be a leaf module — no imports from engine, router, or tools/subagent."""
 

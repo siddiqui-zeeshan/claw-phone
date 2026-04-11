@@ -455,13 +455,11 @@ async def _run_agent(
     _agents[agent_id]["started_at"] = datetime.now(timezone.utc).isoformat()
 
     try:
-        from spare_paw.bot.handler import _build_system_prompt
+        from spare_paw.core.prompt import build_subagent_prompt
         from spare_paw.router.tool_loop import run_tool_loop
 
-        # Build system prompt
-        system_prompt = await _build_system_prompt(app_state.config)
-        if system_suffix:
-            system_prompt = f"{system_prompt}\n\n{system_suffix}"
+        # Build lightweight system prompt for subagent
+        system_prompt = await build_subagent_prompt(suffix=system_suffix)
 
         # Resolve model (explicit → role-specific → main_agent)
         agent_type = _agents[agent_id].get("agent_type")

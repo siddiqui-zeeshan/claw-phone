@@ -317,7 +317,7 @@ async def test_run_agent_accumulates_usage():
     mock_usage = {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
 
     with patch("spare_paw.router.tool_loop.run_tool_loop", return_value=("result text", mock_usage)):
-        with patch("spare_paw.bot.handler._build_system_prompt", return_value="sys"):
+        with patch("spare_paw.core.prompt.build_subagent_prompt", return_value="sys"):
             await subagent_mod._run_agent(
                 agent_id, "test prompt", app_state,
                 model=None, tools_filter=None, max_iterations=5,
@@ -477,7 +477,7 @@ async def test_run_agent_forwards_tool_limits_to_tool_loop():
     expected_limits = {"shell": 30, "web_search": 3}
 
     with patch("spare_paw.router.tool_loop.run_tool_loop", return_value=("ok", {})) as mock_loop:
-        with patch("spare_paw.bot.handler._build_system_prompt", return_value="sys"):
+        with patch("spare_paw.core.prompt.build_subagent_prompt", return_value="sys"):
             await subagent_mod._run_agent(
                 agent_id, "test", app_state,
                 model=None, tools_filter=None, max_iterations=5,
@@ -590,7 +590,7 @@ async def test_cancelled_agent_sets_timed_out():
         raise asyncio.CancelledError()
 
     with patch("spare_paw.router.tool_loop.run_tool_loop", side_effect=_raise_cancelled):
-        with patch("spare_paw.bot.handler._build_system_prompt", return_value="sys"):
+        with patch("spare_paw.core.prompt.build_subagent_prompt", return_value="sys"):
             await subagent_mod._run_agent(
                 agent_id, "test", app_state,
                 model=None, tools_filter=None, max_iterations=5,
@@ -1238,7 +1238,7 @@ async def test_subagent_has_consult_main_tool():
         return ("done", {})
 
     with patch("spare_paw.router.tool_loop.run_tool_loop", side_effect=_capture_tool_loop):
-        with patch("spare_paw.bot.handler._build_system_prompt", return_value="sys"):
+        with patch("spare_paw.core.prompt.build_subagent_prompt", return_value="sys"):
             await subagent_mod._run_agent(
                 agent_id, "test", app_state,
                 model=None, tools_filter=None, max_iterations=5,

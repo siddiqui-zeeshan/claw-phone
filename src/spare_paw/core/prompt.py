@@ -76,3 +76,30 @@ async def build_system_prompt(config: Any) -> str:
         logger.debug("Failed to load knowledge for system prompt", exc_info=True)
 
     return "\n\n".join(sections)
+
+
+async def build_subagent_prompt(suffix: str | None = None) -> str:
+    """Build a lightweight system prompt for subagents.
+
+    Includes only current time and user timezone (from USER.md).
+    Excludes identity, system details, memories, knowledge, and skills.
+    """
+    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    sections = [f"Current time: {current_time}"]
+
+    # Extract timezone from USER.md if available
+    user_md = _PROMPT_DIR / "USER.md"
+    if user_md.is_file():
+        try:
+            content = user_md.read_text(encoding="utf-8")
+            for line in content.splitlines():
+                if "timezone" in line.lower():
+                    sections.append(f"User timezone: {line.split(':', 1)[-1].strip()}")
+                    break
+        except OSError:
+            pass
+
+    if suffix:
+        sections.append(suffix)
+
+    return "\n\n".join(sections)
