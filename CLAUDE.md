@@ -6,11 +6,11 @@ After implementing any new feature or significant change, automatically update R
 
 ## Deployment
 
-The phone is accessible via `ssh termux-phone`. After code changes:
-1. `scp` changed files to `termux-phone:~/spare-paw/...`
-2. `ssh termux-phone "pkill -f 'spare_paw'"` to stop
-3. Restart: `ssh termux-phone "cd ~/spare-paw && nohup python -m spare_paw gateway > /data/data/com.termux/files/usr/tmp/spare-paw.log 2>&1 &"`
-4. Check logs: `ssh termux-phone "tail -N /data/data/com.termux/files/usr/tmp/spare-paw.log | grep -v 'getUpdates'"`
+The bot runs on a Linux machine accessible via `ssh deploy-host`. It is installed as a pip package in `~/.spare-paw/venv/` (no git checkout on the host). After code changes:
+1. Push to GitHub
+2. `ssh deploy-host "~/.spare-paw/venv/bin/pip install --upgrade git+https://github.com/siddiqui-zeeshan/spare-paw.git"`
+3. `ssh deploy-host "systemctl --user restart spare-paw"`
+4. Check logs: `ssh deploy-host "journalctl --user -u spare-paw -n 50 --no-pager | grep -v 'getUpdates'"`
 
 ## Prompt files
 
