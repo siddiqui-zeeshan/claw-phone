@@ -9,3 +9,10 @@ dist/
 build/
 .pytest_cache/
 META-INF/
+
+# Personal/operational — keep out of the repo
+docker-flirty/
+feat/
+*.log
+logs/
+IDENTITY_vareesha.md

@@ -33,7 +33,7 @@ class TestRedactSecrets:
             ),
             # Telegram bot token
             (
-                "bot REDACTED_TELEGRAM_BOT_TOKEN",
+                "bot 1234567890:" + "A" * 35,
                 "bot [REDACTED]",
             ),
             # Bearer token (long enough)
