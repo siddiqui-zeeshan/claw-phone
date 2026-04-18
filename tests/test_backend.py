@@ -131,3 +131,22 @@ class TestMessageBackendProtocol:
         await backend.send_notification("alert", [{"label": "OK", "callback_data": "ok"}])
         await backend.start()
         await backend.stop()
+
+
+class _MinimalBackend:
+    async def send_text(self, text): pass
+    async def send_file(self, path, caption=""): pass
+    async def send_typing(self): pass
+    async def send_notification(self, text, actions=None): pass
+    async def start(self): pass
+    async def stop(self): pass
+
+
+def test_minimal_backend_satisfies_protocol():
+    backend = _MinimalBackend()
+    assert isinstance(backend, MessageBackend)
+
+
+def test_protocol_exposes_optional_hooks():
+    assert hasattr(MessageBackend, "on_token")
+    assert hasattr(MessageBackend, "on_tool_event")

@@ -55,3 +55,21 @@ class MessageBackend(Protocol):
     async def start(self) -> None: ...
 
     async def stop(self) -> None: ...
+
+
+def _on_token_default(self: MessageBackend, token: str) -> None:
+    """Called for each streamed text token. Default: no-op."""
+    return None
+
+
+def _on_tool_event_default(self: MessageBackend, event: object) -> None:
+    """Called for each tool lifecycle event (start/end). Default: no-op."""
+    return None
+
+
+# Attach as optional hooks *after* the Protocol body so they are not part of
+# ``__protocol_attrs__`` — backends that do not implement them still satisfy
+# ``isinstance(backend, MessageBackend)``, while backends that do override them
+# are picked up via duck-typing (``getattr(backend, "on_token", None)``).
+MessageBackend.on_token = _on_token_default  # type: ignore[attr-defined]
+MessageBackend.on_tool_event = _on_tool_event_default  # type: ignore[attr-defined]
