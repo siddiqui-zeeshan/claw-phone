@@ -227,7 +227,7 @@ class WebhookBackend:
             msg = {
                 "type": "tool_call",
                 "tool": event.tool_name,
-                "args": str(event.tool_args)[:200] if event.tool_args else "",
+                "args": event.tool_args or {},
             }
         elif event.kind == "tool_end":
             msg = {

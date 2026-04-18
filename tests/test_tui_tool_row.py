@@ -55,3 +55,24 @@ async def test_tool_row_toggle_expand():
         assert tr.expanded is True
         assert "path" in tr.render_text()
         assert "result text" in tr.render_text()
+
+
+class _HostStringArgs(App):
+    def compose(self):
+        yield ToolRow(
+            call_id="c1",
+            tool="read_file",
+            args="{'path': 'foo.py'}",  # string, not dict — webhook used to send this
+            id="tr",
+        )
+
+
+@pytest.mark.asyncio
+async def test_tool_row_tolerates_string_args():
+    """Non-dict args must not crash render_text (remote webhook compatibility)."""
+    app = _HostStringArgs()
+    async with app.run_test():
+        tr = app.query_one("#tr", ToolRow)
+        text = tr.render_text()
+        assert "read_file" in text
+        assert "path" in text  # args rendered somehow, not crashed

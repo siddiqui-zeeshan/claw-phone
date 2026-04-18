@@ -94,6 +94,9 @@ class ToolRow(Static):
     def _summarize_args(self) -> str:
         if not self.args:
             return ""
+        if not isinstance(self.args, dict):
+            text = str(self.args)
+            return text if len(text) <= 60 else text[:57] + "..."
         parts: list[str] = []
         for key, val in list(self.args.items())[:3]:
             rendered = repr(val) if not isinstance(val, str) else f"'{val}'"

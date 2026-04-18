@@ -333,7 +333,7 @@ class TestOnToolEvent:
             msg = queue.get_nowait()
             assert msg["type"] == "tool_call"
             assert msg["tool"] == "shell"
-            assert "ls" in msg["args"]
+            assert msg["args"] == {"command": "ls"}
         finally:
             _current_session.reset(token)
 
