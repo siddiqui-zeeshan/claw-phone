@@ -119,6 +119,8 @@ class RemoteClient:
                         if event.get("type") == "text":
                             return
                 return
+            except PermissionError:
+                raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 self._set_state(ConnectionState.RECONNECTING)
                 delay = self._next_backoff()

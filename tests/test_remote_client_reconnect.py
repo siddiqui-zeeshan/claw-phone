@@ -48,18 +48,32 @@ async def test_stream_response_retries_on_drop(monkeypatch):
     attempts = {"n": 0}
 
     class _FakeLineIter:
-        def __init__(self, lines): self._lines = lines
-        def __aiter__(self): return self._iter()
+        def __init__(self, lines):
+            self._lines = lines
+
+        def __aiter__(self):
+            return self._iter()
+
         async def _iter(self):
-            for l in self._lines:
-                yield l
+            for line in self._lines:
+                yield line
 
     class _FakeResp:
-        def __init__(self, lines): self.content = _FakeLineIter(lines); self.status = 200
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-        async def text(self): return ""
-        def raise_for_status(self): pass
+        def __init__(self, lines):
+            self.content = _FakeLineIter(lines)
+            self.status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def text(self):
+            return ""
+
+        def raise_for_status(self):
+            pass
 
     class _FakeSession:
         def get(self, *a, **kw):
