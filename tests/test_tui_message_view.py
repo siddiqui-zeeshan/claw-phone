@@ -52,3 +52,21 @@ async def test_user_message_shows_text_static():
     async with app.run_test() as _pilot:
         mv = app.query_one("#u", MessageView)
         assert "hello there" in mv.live_text
+
+
+@pytest.mark.asyncio
+async def test_message_view_header_has_no_hardcoded_width():
+    from textual.widgets import Static
+    from textual.app import App as _App
+
+    class _Host(_App):
+        def compose(self):
+            yield MessageView(role="user", initial_text="x", id="u")
+
+    app = _Host()
+    async with app.run_test() as _pilot:
+        mv = app.query_one("#u", MessageView)
+        # Header should not contain 55+ space runs (that was the old 60-char padding)
+        header = mv.query(Static).first()
+        rendered = str(header.render())
+        assert "        " * 7 not in rendered  # no 56+ consecutive spaces
