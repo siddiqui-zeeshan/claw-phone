@@ -114,6 +114,14 @@ class SparePawTUI(App):
         if result.kind == "quit":
             self.exit()
             return
+        if result.kind == "find":
+            hits = log.search(result.content)
+            if not hits:
+                log.append_error(f"No matches for '{result.content}'")
+            else:
+                hits[-1].scroll_visible()
+                log.append_error(f"{len(hits)} matches — showing last")
+            return
         if result.kind == "text":
             log.mount_turn(MessageView(role="assistant", initial_text=result.content, historical=True))
             return

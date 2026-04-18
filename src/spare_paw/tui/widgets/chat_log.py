@@ -35,3 +35,14 @@ class ChatLog(VerticalScroll):
         for turn in turns:
             self.mount(turn)
         self.scroll_end(animate=False)
+
+    def search(self, query: str) -> list[MessageView]:
+        """Return MessageViews whose live_text contains ``query`` (case-insensitive)."""
+        if not query:
+            return []
+        q = query.lower()
+        hits: list[MessageView] = []
+        for view in self.query(MessageView):
+            if q in view.live_text.lower():
+                hits.append(view)
+        return hits

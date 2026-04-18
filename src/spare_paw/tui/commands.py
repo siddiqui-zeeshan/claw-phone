@@ -24,7 +24,7 @@ HELP_TEXT = (
 
 @dataclass
 class CommandResult:
-    kind: str  # "send" | "send_image" | "text" | "quit" | "forget"
+    kind: str  # "send" | "send_image" | "text" | "quit" | "forget" | "find"
     content: str = ""        # rich text or markdown to display
     text: str = ""           # user text to send to engine
     plan: bool = False
@@ -72,6 +72,11 @@ class SlashCommandRouter:
             if not body:
                 return CommandResult(kind="text", content="Usage: /plan <prompt>")
             return CommandResult(kind="send", text=body, plan=True)
+
+        if lower.startswith("/find "):
+            return CommandResult(kind="find", content=text[len("/find "):].strip())
+        if lower == "/find":
+            return CommandResult(kind="text", content="Usage: /find <query>")
 
         if text.startswith("/"):
             return CommandResult(
