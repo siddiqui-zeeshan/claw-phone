@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -88,31 +89,48 @@ class RemoteClient:
                 except json.JSONDecodeError:
                     continue
 
-    async def stream_response(self) -> AsyncIterator[dict[str, Any]]:
-        """Stream SSE events for a single request/response cycle.
+    async def stream_response(self):
+        """Stream SSE events, auto-reconnecting on transient drops.
 
-        Opens an SSE connection, yields events, and auto-closes after
-        receiving a ``type: text`` event (final response).
+        Yields events until a ``type: text`` (final response) arrives or
+        the user cancels.
         """
-        session = self._get_session()
-        async with session.get(
-            f"{self._url}/stream",
-            timeout=aiohttp.ClientTimeout(total=0),
-        ) as resp:
-            if resp.status == 401:
-                raise PermissionError("Authentication failed — check remote.secret")
-            resp.raise_for_status()
-            async for line in resp.content:
-                decoded = line.decode("utf-8").strip()
-                if not decoded.startswith("data: "):
-                    continue
-                try:
-                    event = json.loads(decoded[6:])
-                except json.JSONDecodeError:
-                    continue
-                yield event
-                if event.get("type") == "text":
-                    return
+        while True:
+            try:
+                self._set_state(ConnectionState.CONNECTED)
+                session = self._get_session()
+                async with session.get(
+                    f"{self._url}/stream",
+                    timeout=aiohttp.ClientTimeout(total=0),
+                ) as resp:
+                    if resp.status == 401:
+                        self._set_state(ConnectionState.DISCONNECTED)
+                        raise PermissionError("Authentication failed — check remote.secret")
+                    resp.raise_for_status()
+                    async for line in resp.content:
+                        decoded = line.decode("utf-8").strip()
+                        if not decoded.startswith("data: "):
+                            continue
+                        try:
+                            event = json.loads(decoded[6:])
+                        except json.JSONDecodeError:
+                            continue
+                        yield event
+                        if event.get("type") == "text":
+                            return
+                return
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                self._set_state(ConnectionState.RECONNECTING)
+                delay = self._next_backoff()
+                logger.warning(
+                    "Remote stream dropped (%s), reconnecting in %.1fs",
+                    exc, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            except asyncio.CancelledError:
+                self._set_state(ConnectionState.DISCONNECTED)
+                raise
 
     async def health(self) -> bool:
         """GET /health, returns True if server is up."""
