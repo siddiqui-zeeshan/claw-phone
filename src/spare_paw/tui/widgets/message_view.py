@@ -7,7 +7,8 @@ from typing import Literal
 
 from textual.app import ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Static
+from textual.widget import Widget
+from textual.widgets import Markdown, Static
 
 from spare_paw.tui.widgets.tool_row import ToolRow
 
@@ -21,9 +22,10 @@ def _fmt_timestamp(dt: datetime | None = None) -> str:
 class MessageView(Vertical):
     """One conversation turn.
 
-    Assistant variants stream tokens via ``append_stream`` into the body
-    ``Static``; on ``finalize`` the plain-text body is swapped to rendered
-    Markdown. User variants are static from construction.
+    Assistant variants stream plain-text tokens into a ``Static`` body;
+    on ``finalize`` the Static is replaced with a rendered Markdown widget
+    so bold/italic/tables/lists display properly. Historical assistant
+    messages skip the streaming step and render as Markdown directly.
     """
 
     def __init__(
@@ -40,6 +42,7 @@ class MessageView(Vertical):
         self.finalized = False
         self._historical = historical
         self._timestamp = timestamp or datetime.now()
+        self._body: Widget | None = None
         self.add_class(role)
 
     def compose(self) -> ComposeResult:
@@ -47,12 +50,16 @@ class MessageView(Vertical):
         header = f"[bold]{label}[/bold]   [dim]{_fmt_timestamp(self._timestamp)}[/dim]"
         yield Static(header, classes="header")
         if self.live_text:
-            self._body = Static(self.live_text)
+            if self.role == "assistant" and self._historical:
+                self._body = Markdown(self.live_text)
+                self.finalized = True
+            else:
+                self._body = Static(self.live_text)
             yield self._body
 
     def _ensure_body(self) -> None:
-        """Lazily mount the text body so it renders *below* any tool rows."""
-        if not hasattr(self, "_body"):
+        """Lazily mount the streaming body below any existing tool rows."""
+        if self._body is None:
             self._body = Static(self.live_text)
             self.mount(self._body)
 
@@ -61,20 +68,27 @@ class MessageView(Vertical):
             return
         self.live_text += chunk
         self._ensure_body()
-        self._body.update(self.live_text)
+        if isinstance(self._body, Static):
+            self._body.update(self.live_text)
 
     def finalize(self) -> None:
-        """Swap the live plain-text body for rendered Markdown."""
+        """Swap the streaming Static body for a rendered Markdown widget."""
         if self.finalized:
             return
         self.finalized = True
-        if self.role == "assistant" and self.live_text and hasattr(self, "_body"):
-            from rich.markdown import Markdown
-
-            self._body.update(Markdown(self.live_text))
+        if self.role != "assistant" or not self.live_text:
+            return
+        if isinstance(self._body, Markdown):
+            return
+        old_body = self._body
+        new_body = Markdown(self.live_text)
+        self._body = new_body
+        self.mount(new_body)
+        if old_body is not None:
+            old_body.remove()
 
     def mark_cancelled(self) -> None:
-        if not hasattr(self, "_body"):
+        if not isinstance(self._body, Static):
             return
         self.finalized = True
         self._body.update(

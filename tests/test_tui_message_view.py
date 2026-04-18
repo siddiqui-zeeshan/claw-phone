@@ -55,6 +55,65 @@ async def test_user_message_shows_text_static():
 
 
 @pytest.mark.asyncio
+async def test_finalize_mounts_markdown_widget():
+    """After finalize, the body must be a Textual Markdown widget, not a Static."""
+    from textual.widgets import Markdown as TxMarkdown
+
+    app = _Host()
+    async with app.run_test() as pilot:
+        mv = app.query_one("#mv", MessageView)
+        mv.append_stream("**bold** and _italic_\n\n- item")
+        await pilot.pause()
+        mv.finalize()
+        await pilot.pause()
+        assert any(isinstance(c, TxMarkdown) for c in mv.children), (
+            f"expected a Markdown widget after finalize, got: "
+            f"{[type(c).__name__ for c in mv.children]}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_historical_assistant_message_renders_markdown():
+    """Historical assistant messages must be rendered as Markdown too."""
+    from textual.widgets import Markdown as TxMarkdown
+
+    class _HistoricHost(App):
+        def compose(self):
+            yield MessageView(
+                role="assistant",
+                initial_text="**Bold** text",
+                historical=True,
+                id="hist",
+            )
+
+    app = _HistoricHost()
+    async with app.run_test() as _pilot:
+        mv = app.query_one("#hist", MessageView)
+        assert any(isinstance(c, TxMarkdown) for c in mv.children), (
+            f"expected Markdown widget in historical assistant view, got: "
+            f"{[type(c).__name__ for c in mv.children]}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_historical_user_message_stays_plain():
+    """User messages stay plain text (no markdown interpretation)."""
+    from textual.widgets import Markdown as TxMarkdown, Static
+
+    class _UHost(App):
+        def compose(self):
+            yield MessageView(role="user", initial_text="hello *world*", id="u")
+
+    app = _UHost()
+    async with app.run_test() as _pilot:
+        mv = app.query_one("#u", MessageView)
+        assert not any(isinstance(c, TxMarkdown) for c in mv.children), (
+            "user messages must not be rendered as Markdown"
+        )
+        assert any(isinstance(c, Static) for c in mv.children)
+
+
+@pytest.mark.asyncio
 async def test_tool_rows_appear_above_streamed_text():
     """When tool_calls happen before the final text, UI order must mirror that."""
     from spare_paw.tui.widgets.tool_row import ToolRow
