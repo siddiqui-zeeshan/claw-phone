@@ -61,6 +61,53 @@ async def test_synthesize_success_returns_bytes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_synthesize_sends_instructions_when_configured(monkeypatch):
+    captured = {}
+
+    class FakeResp:
+        status = 200
+        async def read(self): return b"audio"
+        async def text(self): return ""
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): return False
+
+    class FakeSession:
+        def post(self, url, json=None, headers=None, timeout=None):
+            captured["body"] = json
+            return FakeResp()
+        closed = False
+
+    monkeypatch.setattr(tts, "_get_session", lambda: FakeSession())
+
+    cfg = _fake_config(**{"voice.tts_instructions": "Speak warmly."})
+    await tts.synthesize("hi", "nova", cfg)
+    assert captured["body"]["instructions"] == "Speak warmly."
+
+
+@pytest.mark.asyncio
+async def test_synthesize_omits_instructions_when_not_configured(monkeypatch):
+    captured = {}
+
+    class FakeResp:
+        status = 200
+        async def read(self): return b"audio"
+        async def text(self): return ""
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): return False
+
+    class FakeSession:
+        def post(self, url, json=None, headers=None, timeout=None):
+            captured["body"] = json
+            return FakeResp()
+        closed = False
+
+    monkeypatch.setattr(tts, "_get_session", lambda: FakeSession())
+
+    await tts.synthesize("hi", "nova", _fake_config())
+    assert "instructions" not in captured["body"]
+
+
+@pytest.mark.asyncio
 async def test_synthesize_429_retries_then_succeeds(monkeypatch):
     call_count = {"n": 0}
     audio = b"final-bytes"

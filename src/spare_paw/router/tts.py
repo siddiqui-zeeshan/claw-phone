@@ -65,13 +65,16 @@ async def synthesize(text: str, voice: str, config: Any) -> bytes:
     api_key = config.get("openrouter.api_key")
     model = config.get("voice.tts_model", "openai/gpt-4o-mini-tts-2025-12-15")
     timeout_s = config.get("voice.tts_timeout_seconds", 30)
+    instructions = config.get("voice.tts_instructions")
 
-    body = {
+    body: dict[str, Any] = {
         "model": model,
         "input": text,
         "voice": voice,
         "response_format": "mp3",
     }
+    if instructions:
+        body["instructions"] = instructions
     headers = {
         "Authorization": f"Bearer {api_key}",
         "HTTP-Referer": "https://github.com/spare-paw/spare-paw",

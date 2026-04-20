@@ -83,6 +83,12 @@ def _build_defaults() -> dict[str, Any]:
             "tts_enabled": True,
             "tts_voice": "nova",
             "tts_model": "openai/gpt-4o-mini-tts-2025-12-15",
+            "tts_instructions": (
+                "Speak warmly and conversationally, like a close friend. "
+                "Natural pacing with gentle pauses at commas and periods. "
+                "Slightly expressive and engaged, never monotone. "
+                "Use a relaxed, present tone."
+            ),
             "tts_max_chars": 2000,
             "tts_timeout_seconds": 30,
             "ffmpeg_path": "ffmpeg",
