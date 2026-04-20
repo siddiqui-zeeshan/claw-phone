@@ -20,8 +20,14 @@ logger = logging.getLogger(__name__)
 _PROMPT_DIR = Path.home() / ".spare-paw"
 _PROMPT_FILES = ["IDENTITY.md", "USER.md", "SYSTEM.md"]
 
+VOICE_MODE_HINT = (
+    "You are replying by voice. Keep responses conversational and natural. "
+    "No markdown, no code blocks, no bullet lists, no URLs read aloud. "
+    "Spell numbers in words when natural. Avoid section headings."
+)
 
-async def build_system_prompt(config: Any) -> str:
+
+async def build_system_prompt(config: Any, voice_mode: bool = False) -> str:
     """Build the system prompt from config + markdown files + memories.
 
     Loads IDENTITY.md, USER.md, and SYSTEM.md (if they exist) and appends
@@ -74,6 +80,9 @@ async def build_system_prompt(config: Any) -> str:
             sections.append(knowledge)
     except Exception:
         logger.debug("Failed to load knowledge for system prompt", exc_info=True)
+
+    if voice_mode:
+        sections.append(VOICE_MODE_HINT)
 
     return "\n\n".join(sections)
 
