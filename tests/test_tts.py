@@ -13,7 +13,7 @@ def _fake_config(**overrides):
     defaults = {
         "voice.tts_model": "openai/gpt-4o-mini-tts-2025-12-15",
         "voice.tts_timeout_seconds": 30,
-        "openrouter_api_key": "test-key",
+        "openrouter.api_key": "test-key",
     }
     defaults.update(overrides)
     cfg.get = lambda k, default=None: defaults.get(k, default)
@@ -129,7 +129,7 @@ async def test_synthesize_error_does_not_leak_api_key(monkeypatch):
     monkeypatch.setattr(tts, "_get_session", lambda: FakeSession())
     monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
-    cfg = _fake_config(openrouter_api_key="super-secret-key-xyz")
+    cfg = _fake_config(**{"openrouter.api_key": "super-secret-key-xyz"})
     with pytest.raises(tts.TTSError) as excinfo:
         await tts.synthesize("hello", "nova", cfg)
     assert "super-secret-key-xyz" not in str(excinfo.value)

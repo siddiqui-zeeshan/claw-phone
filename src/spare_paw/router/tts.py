@@ -17,7 +17,7 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
+TTS_URL = "https://openrouter.ai/api/v1/tts"
 
 KNOWN_VOICES: tuple[str, ...] = (
     "alloy", "ash", "ballad", "coral", "echo",
@@ -62,7 +62,7 @@ async def synthesize(text: str, voice: str, config: Any) -> bytes:
     if voice not in KNOWN_VOICES:
         raise ValueError(f"Unknown voice: {voice!r}. Known: {KNOWN_VOICES}")
 
-    api_key = config.get("openrouter_api_key")
+    api_key = config.get("openrouter.api_key")
     model = config.get("voice.tts_model", "openai/gpt-4o-mini-tts-2025-12-15")
     timeout_s = config.get("voice.tts_timeout_seconds", 30)
 
