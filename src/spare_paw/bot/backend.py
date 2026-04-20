@@ -189,6 +189,15 @@ class TelegramBackend:
                     chat_id=self._chat_id, document=f, caption=caption or None,
                 )
 
+    async def send_voice(self, ogg_bytes: bytes) -> None:
+        """Send raw opus/ogg bytes as a Telegram voice note."""
+        from telegram import InputFile
+
+        await self.bot.send_voice(
+            chat_id=self._chat_id,
+            voice=InputFile(ogg_bytes, filename="voice.ogg"),
+        )
+
     async def send_typing(self) -> None:
         await self.bot.send_chat_action(
             chat_id=self._chat_id, action=ChatAction.TYPING,

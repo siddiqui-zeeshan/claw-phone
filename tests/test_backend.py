@@ -77,6 +77,9 @@ class TestMessageBackendProtocol:
             async def send_file(self, path: str, caption: str = "") -> None:
                 pass
 
+            async def send_voice(self, ogg_bytes: bytes) -> None:
+                pass
+
             async def send_typing(self) -> None:
                 pass
 
@@ -136,6 +139,7 @@ class TestMessageBackendProtocol:
 class _MinimalBackend:
     async def send_text(self, text): pass
     async def send_file(self, path, caption=""): pass
+    async def send_voice(self, ogg_bytes): pass
     async def send_typing(self): pass
     async def send_notification(self, text, actions=None): pass
     async def start(self): pass
