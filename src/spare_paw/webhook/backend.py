@@ -262,6 +262,13 @@ class WebhookBackend:
         self._put_session_queue(msg)
         self._broadcast_sse(msg)
 
+    async def send_voice(self, ogg_bytes: bytes) -> None:
+        """Voice delivery is not supported on the webhook backend yet."""
+        raise NotImplementedError(
+            "Voice delivery is not supported on the webhook backend. "
+            "Use the Telegram backend or disable talk mode."
+        )
+
     async def send_typing(self) -> None:
         self._broadcast_sse({"type": "typing"})
 
