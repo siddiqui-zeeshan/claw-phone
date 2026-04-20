@@ -301,6 +301,31 @@ Returns a JSON array of recent messages (newest last). `limit` defaults to 50.
 | `/models <filter>` | Filter available models by keyword (e.g. `/models gemini`) |
 | `/plan <prompt>` | Deep thinking: plan before executing (decomposes into steps, then runs) |
 | `/mcp` | List connected MCP servers and their tools |
+| `/talk` | Show current talk-mode state (mirror vs always-voice) |
+| `/talk on` | Make every reply in the current conversation a voice note |
+| `/talk off` | Return to mirror mode (voice in -> voice out, text in -> text out) |
+| `/voice` | Show the current TTS voice for this conversation |
+| `/voice <name>` | Set the TTS voice (e.g. `/voice shimmer`) |
+| `/voice list` | List all available TTS voices |
+
+## Voice Replies (Talk Mode)
+
+spare-paw can reply by voice using OpenRouter TTS (`openai/gpt-4o-mini-tts-2025-12-15`). Voice replies are delivered as native Telegram voice notes (ogg/opus).
+
+- **Default behavior (mirror)** -- voice in -> voice out, text in -> text out. No configuration needed.
+- **Always-voice mode** -- `/talk on` makes every reply a voice note until you send `/talk off`. `/talk` alone reports the current state.
+- **Voice selection** -- 10 voices supported: `alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, `shimmer`. Default is `nova` (configurable via `voice.tts_voice` in `~/.spare-paw/config.yaml`). Use `/voice <name>` to set per-conversation, `/voice list` to see all, `/voice` to report the current one.
+- **Length cap** -- replies over 2000 characters are sent as text with a warning banner. Configurable via `voice.tts_max_chars`.
+- **On failure** -- if TTS or ffmpeg fails for a specific reply, the bot falls back to text with a one-time "Voice generation failed" notice.
+- **Disable globally** -- set `voice.tts_enabled: false` in `~/.spare-paw/config.yaml`.
+
+### System requirement
+
+`ffmpeg` must be on `PATH` (used to transcode TTS output to ogg/opus):
+
+- Termux: `pkg install ffmpeg`
+- Debian/Ubuntu: `sudo apt install ffmpeg`
+- macOS: `brew install ffmpeg`
 
 ## Tools
 
