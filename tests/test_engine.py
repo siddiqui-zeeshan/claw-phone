@@ -93,6 +93,8 @@ class TestProcessMessage:
                 {"role": "system", "content": "system prompt"},
                 {"role": "user", "content": "hello"},
             ])
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -120,6 +122,8 @@ class TestProcessMessage:
                 {"role": "system", "content": "sys"},
                 {"role": "user", "content": "do something complex"},
             ])
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -129,13 +133,23 @@ class TestProcessMessage:
     async def test_voice_message(self):
         """Voice message: transcribe bytes, then proceed as text."""
         app_state = _make_app_state()
+        # Disable TTS so the voice-in reply routes back through send_text
+        # (the voice delivery branch is exercised in test_engine_voice_delivery.py).
+        app_state.config.get = lambda key, default=None: {
+            "models.main_agent": "test-model",
+            "models.summary": "summary-model",
+            "models.vision": "vision-model",
+            "agent.max_tool_iterations": 5,
+            "agent.system_prompt": "You are a test bot.",
+            "voice.tts_enabled": False,
+        }.get(key, default)
         backend = _make_backend()
         msg = IncomingMessage(voice_bytes=b"\x00\x01\x02")
 
         with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
              patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="Voice reply"), \
              patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
-             patch("spare_paw.core.engine.transcribe", new_callable=AsyncMock, return_value="transcribed text"), \
+             patch("spare_paw.core.engine.voice_module.transcribe", new_callable=AsyncMock, return_value="transcribed text"), \
              patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock):
             mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
             mock_ctx.ingest = AsyncMock(return_value="msg-1")
@@ -143,6 +157,8 @@ class TestProcessMessage:
                 {"role": "system", "content": "sys"},
                 {"role": "user", "content": "transcribed text"},
             ])
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -167,6 +183,8 @@ class TestProcessMessage:
                 {"role": "system", "content": "sys"},
                 {"role": "user", "content": "what is this?"},
             ])
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -191,6 +209,8 @@ class TestProcessMessage:
             mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
             mock_ctx.ingest = AsyncMock(return_value="msg-1")
             mock_ctx.assemble = AsyncMock(return_value=assembled)
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -232,6 +252,8 @@ class TestProcessMessageWithPlan:
             mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
             mock_ctx.ingest = AsyncMock(return_value="msg-1")
             mock_ctx.assemble = AsyncMock(return_value=assembled)
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -261,6 +283,8 @@ class TestProcessMessageWithPlan:
             mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
             mock_ctx.ingest = AsyncMock(return_value="msg-1")
             mock_ctx.assemble = AsyncMock(return_value=assembled)
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -286,6 +310,8 @@ class TestProcessMessageWithPlan:
                 {"role": "system", "content": "system prompt"},
                 {"role": "user", "content": "hello"},
             ])
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -309,6 +335,8 @@ class TestProcessAgentCallback:
                 {"role": "system", "content": "sys"},
                 {"role": "user", "content": "agent results"},
             ])
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_agent_callback(app_state, "agent results", backend)
 
@@ -337,6 +365,8 @@ class TestProcessAgentCallback:
             mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
             mock_ctx.ingest = AsyncMock(return_value="msg-1")
             mock_ctx.assemble = AsyncMock(return_value=[])
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_agent_callback(app_state, "agent results", backend)
 
@@ -462,6 +492,8 @@ class TestVisionPreprocessing:
             mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
             mock_ctx.ingest = AsyncMock(return_value="msg-1")
             mock_ctx.assemble = AsyncMock(return_value=assembled)
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -491,6 +523,8 @@ class TestVisionPreprocessing:
             mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
             mock_ctx.ingest = AsyncMock(return_value="msg-1")
             mock_ctx.assemble = AsyncMock(return_value=assembled)
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -515,6 +549,8 @@ class TestVisionPreprocessing:
                 {"role": "system", "content": "sys"},
                 {"role": "user", "content": "hello"},
             ])
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
@@ -540,6 +576,8 @@ class TestVisionPreprocessing:
             mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
             mock_ctx.ingest = AsyncMock(return_value="msg-1")
             mock_ctx.assemble = AsyncMock(return_value=assembled)
+            mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+            mock_ctx.set_conversation_meta = AsyncMock()
 
             await process_message(app_state, msg, backend)
 
