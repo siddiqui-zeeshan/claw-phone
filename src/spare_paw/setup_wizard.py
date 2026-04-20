@@ -41,6 +41,9 @@ tavily:
 groq:
   api_key: "{{groq_key}}"
 
+voice:
+  tts_enabled: {{tts_enabled}}
+
 context:
   max_messages: 64
   token_budget: 120000
@@ -204,6 +207,13 @@ def run() -> None:
     tavily_key = _prompt_optional("Tavily Search API key")
     groq_key = _prompt_optional("Groq API key (for voice messages)")
 
+    # Voice replies (talk mode) — needs ffmpeg on PATH
+    tts_default = "y"
+    answer = input(
+        f"  Enable voice replies (talk mode)? Requires ffmpeg on PATH. [{tts_default}/n]: "
+    ).strip().lower() or tts_default
+    tts_enabled = "true" if answer != "n" else "false"
+
     # 4. Write config
     platform = detect_platform()
     template = _config_template(platform)
@@ -214,6 +224,7 @@ def run() -> None:
         openrouter_key=openrouter_key,
         tavily_key=tavily_key,
         groq_key=groq_key,
+        tts_enabled=tts_enabled,
     )
     CONFIG_PATH.write_text(config_content, encoding="utf-8")
     # Restrict permissions — config contains secrets
