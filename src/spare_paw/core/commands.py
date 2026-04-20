@@ -218,3 +218,60 @@ def _format_timedelta(td: Any) -> str:
         parts.append(f"{minutes}m")
     parts.append(f"{seconds}s")
     return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# /talk and /voice — talk mode management
+# ---------------------------------------------------------------------------
+
+async def cmd_talk(app_state: Any, conversation_id: str, args: list[str]) -> str:
+    """Handle /talk [on|off].
+
+    No args   → report current state.
+    on        → enable talk mode for this conversation.
+    off       → disable talk mode for this conversation.
+    """
+    if not args:
+        meta = await ctx_module.get_conversation_meta(conversation_id)
+        if meta.get("talk_mode"):
+            return "Talk mode is on."
+        return "Talk mode is off (mirror mode)."
+
+    sub = args[0].lower()
+    if sub == "on":
+        if not app_state.config.get("voice.tts_enabled", True):
+            return "Voice replies disabled in config (voice.tts_enabled=false)."
+        await ctx_module.set_conversation_meta(conversation_id, "talk_mode", True)
+        return "🎙️ Talk mode on. I'll reply by voice."
+    if sub == "off":
+        await ctx_module.set_conversation_meta(conversation_id, "talk_mode", False)
+        return "Talk mode off. I'll mirror — voice in, voice out."
+    return "Usage: /talk [on|off]"
+
+
+async def cmd_voice(app_state: Any, conversation_id: str, args: list[str]) -> str:
+    """Handle /voice [<name>|list].
+
+    No args   → report current voice.
+    list      → list known voices.
+    <name>    → set per-conversation voice override (validated against KNOWN_VOICES).
+    """
+    from spare_paw.router.tts import KNOWN_VOICES
+
+    if not args:
+        meta = await ctx_module.get_conversation_meta(conversation_id)
+        override = meta.get("voice")
+        if override:
+            return f"Current voice: {override} (set via /voice)."
+        default = app_state.config.get("voice.tts_voice", "nova")
+        return f"Current voice: {default} (from config)."
+
+    sub = args[0].lower()
+    if sub == "list":
+        return "Voices: " + ", ".join(KNOWN_VOICES)
+    if sub not in KNOWN_VOICES:
+        return (
+            f"Unknown voice \"{sub}\". Try: " + ", ".join(KNOWN_VOICES) + "."
+        )
+    await ctx_module.set_conversation_meta(conversation_id, "voice", sub)
+    return f"Voice set to {sub}."
