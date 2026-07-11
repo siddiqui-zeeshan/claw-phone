@@ -8,8 +8,9 @@ keep the scheduler and database in sync.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, tzinfo
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -29,6 +30,29 @@ class CronScheduler:
         self._app_state = app_state
         self._scheduler: AsyncIOScheduler | None = None
 
+    def _resolve_timezone(self) -> tzinfo:
+        """Resolve the cron timezone: cron.timezone from config, else system local.
+
+        Always explicit so cron firing times never silently depend on the
+        implicit process timezone.
+        """
+        tz_name = None
+        config = getattr(self._app_state, "config", None)
+        if config is not None:
+            try:
+                tz_name = config.get("cron.timezone")
+            except Exception:
+                tz_name = None
+        if isinstance(tz_name, str) and tz_name:
+            try:
+                return ZoneInfo(tz_name)
+            except Exception:
+                logger.warning(
+                    "Invalid cron.timezone %r; falling back to system local timezone",
+                    tz_name,
+                )
+        return datetime.now().astimezone().tzinfo
+
     async def start(self) -> None:
         """Create the scheduler, load all enabled crons from DB, and start."""
         self._scheduler = AsyncIOScheduler()
@@ -39,6 +63,8 @@ class CronScheduler:
             "FROM cron_jobs WHERE enabled = 1"
         ) as cursor:
             rows = await cursor.fetchall()
+
+        tz = self._resolve_timezone()
 
         for row in rows:
             cron_id = row["id"]
@@ -58,13 +84,19 @@ class CronScheduler:
                     tools_list = None
 
             try:
-                trigger = CronTrigger.from_crontab(schedule)
+                trigger = CronTrigger.from_crontab(schedule, timezone=tz)
                 self._scheduler.add_job(
                     self._run_cron,
                     trigger=trigger,
                     id=cron_id,
                     args=[cron_id, prompt, model, tools_list],
                     replace_existing=True,
+                    # A job missed while the process was down (up to 1h) runs
+                    # once on restart instead of being dropped or replayed N times.
+                    misfire_grace_time=3600,
+                    coalesce=True,
+                    # A slow run must not overlap with the next firing.
+                    max_instances=1,
                 )
                 logger.info("Scheduled cron %s (%s)", cron_id, schedule)
             except (ValueError, TypeError) as exc:
@@ -102,13 +134,19 @@ class CronScheduler:
         if self._scheduler is None:
             raise RuntimeError("Scheduler is not running")
 
-        trigger = CronTrigger.from_crontab(schedule)
+        trigger = CronTrigger.from_crontab(schedule, timezone=self._resolve_timezone())
         self._scheduler.add_job(
             self._run_cron,
             trigger=trigger,
             id=cron_id,
             args=[cron_id, prompt, model, tools_allowed],
             replace_existing=True,
+            # A job missed while the process was down (up to 1h) runs
+            # once on restart instead of being dropped or replayed N times.
+            misfire_grace_time=3600,
+            coalesce=True,
+            # A slow run must not overlap with the next firing.
+            max_instances=1,
         )
         logger.info("Added cron job %s (%s)", cron_id, schedule)
 
