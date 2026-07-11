@@ -277,6 +277,88 @@ async def test_compact_preserves_fresh_tail(_init_db):
     config_mod.set_override("context.fresh_tail_count", 32)
 
 
+async def _insert_corrupt_summary_node(conn, conversation_id: str, node_id: str) -> None:
+    """Insert a summary node with garbage (non-JSON) in source_msg_ids."""
+    now = datetime.now(timezone.utc).isoformat()
+    await conn.execute(
+        """INSERT INTO summary_nodes
+           (id, conversation_id, parent_id, depth, content, token_count, source_msg_ids, created_at)
+           VALUES (?, ?, NULL, 0, ?, 10, ?, ?)""",
+        (node_id, conversation_id, "Corrupted node content", "{not valid json", now),
+    )
+    await conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_compact_skips_corrupt_source_msg_ids(_init_db):
+    """A summary node with corrupt source_msg_ids JSON must not crash compact()."""
+    from spare_paw.config import config as config_mod
+    from spare_paw.context import compact
+
+    config_mod.set_override("context.fresh_tail_count", 10)
+
+    conn = _init_db
+    conv_id = await new_conversation()
+
+    await _insert_corrupt_summary_node(conn, conv_id, "corrupt-node")
+
+    for i in range(30):
+        await ingest(conv_id, "user", f"Message number {i} about various topics")
+
+    mock_client = _make_mock_router_client("Summary of old messages.")
+
+    # Must not raise — the corrupt row is treated as covering no messages
+    await compact(conv_id, mock_client, "test-model")
+
+    # Compaction still proceeds and creates fresh leaf summaries
+    async with conn.execute(
+        "SELECT COUNT(*) FROM summary_nodes WHERE conversation_id = ? AND depth = 0 AND id != 'corrupt-node'",
+        (conv_id,),
+    ) as cur:
+        count = (await cur.fetchone())[0]
+    assert count > 0
+
+    config_mod.set_override("context.fresh_tail_count", 32)
+
+
+@pytest.mark.asyncio
+async def test_lcm_expand_handles_corrupt_source_msg_ids(_init_db):
+    """lcm_expand must not crash on a node with corrupt source_msg_ids JSON."""
+    from spare_paw.tools.lcm_tools import _handle_lcm_expand
+
+    conn = _init_db
+    conv_id = await new_conversation()
+    await _insert_corrupt_summary_node(conn, conv_id, "corrupt-expand-node")
+
+    result_json = await _handle_lcm_expand(summary_id="corrupt-expand-node")
+    result = json.loads(result_json)
+
+    assert result.get("messages") == []
+    assert result.get("total_source_messages") == 0
+
+
+@pytest.mark.asyncio
+async def test_lcm_describe_handles_corrupt_source_msg_ids(_init_db):
+    """lcm_describe must not crash when one node has corrupt source_msg_ids JSON."""
+    from spare_paw.tools.lcm_tools import _handle_lcm_describe
+
+    conn = _init_db
+    conv_id = await new_conversation()
+
+    await _insert_summary_node(
+        conn, conv_id, "A healthy summary", node_id="good-node", source_msg_ids=["m1", "m2"],
+    )
+    await _insert_corrupt_summary_node(conn, conv_id, "corrupt-describe-node")
+
+    result_json = await _handle_lcm_describe(conversation_id=conv_id)
+    result = json.loads(result_json)
+
+    assert result["count"] == 2
+    by_id = {s["id"]: s for s in result["summaries"]}
+    assert by_id["good-node"]["source_msg_ids"] == ["m1", "m2"]
+    assert by_id["corrupt-describe-node"]["source_msg_ids"] == []
+
+
 # ---------------------------------------------------------------------------
 # Assembly tests
 # ---------------------------------------------------------------------------
