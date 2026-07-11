@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+import os
+import time
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -59,6 +63,122 @@ class TestBrowserSession:
         await session.close()
         assert session._pending == {}
         assert session._events == {}
+
+
+# -- Session lifecycle -------------------------------------------------------
+
+
+class TestSessionLifecycle:
+    def _patch_launch(self, monkeypatch, tmp_path) -> MagicMock:
+        """Stub out everything around Chromium spawning; returns the Popen mock."""
+        monkeypatch.setattr("spare_paw.tools.browser.SCREENSHOT_DIR", tmp_path)
+        monkeypatch.setattr(
+            "spare_paw.tools.browser.shutil.which", lambda cmd: "/usr/bin/chromium"
+        )
+        monkeypatch.setattr("spare_paw.tools.browser._find_free_port", lambda: 9222)
+        popen_mock = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr("spare_paw.tools.browser.subprocess.Popen", popen_mock)
+        return popen_mock
+
+    @pytest.mark.asyncio
+    async def test_devtools_timeout_terminates_spawned_process(self, monkeypatch, tmp_path):
+        popen_mock = self._patch_launch(monkeypatch, tmp_path)
+        fake_proc = popen_mock.return_value
+
+        async def _never_ready(self, cdp_base, timeout):
+            raise RuntimeError("Chromium DevTools not ready after 15s")
+
+        monkeypatch.setattr(BrowserSession, "_wait_for_devtools", _never_ready)
+
+        session = BrowserSession()
+        with pytest.raises(RuntimeError):
+            await session.ensure_connected()
+
+        assert fake_proc.terminate.called or fake_proc.kill.called, (
+            "spawned Chromium process must be cleaned up when DevTools never comes up"
+        )
+        assert session._process is None
+
+    @pytest.mark.asyncio
+    async def test_concurrent_ensure_connected_spawns_once(self, monkeypatch, tmp_path):
+        popen_mock = self._patch_launch(monkeypatch, tmp_path)
+
+        # An old screenshot that session start should clean up (fix 5)
+        stale = tmp_path / "screenshot_1.png"
+        stale.write_bytes(b"old")
+        eight_days_ago = time.time() - 8 * 86400
+        os.utime(stale, (eight_days_ago, eight_days_ago))
+
+        async def _slow_ready(self, cdp_base, timeout):
+            await asyncio.sleep(0.05)
+            return "ws://127.0.0.1:9222/devtools/page/1"
+
+        monkeypatch.setattr(BrowserSession, "_wait_for_devtools", _slow_ready)
+        monkeypatch.setattr(BrowserSession, "_recv_loop", AsyncMock())
+
+        session = BrowserSession()
+        fake_ws = MagicMock()
+        fake_ws.closed = False
+        http_session = MagicMock()
+        http_session.closed = False
+        http_session.ws_connect = AsyncMock(return_value=fake_ws)
+        session._http_session = http_session
+        monkeypatch.setattr(session, "send", AsyncMock(return_value={}))
+
+        await asyncio.gather(session.ensure_connected(), session.ensure_connected())
+
+        assert popen_mock.call_count == 1, "concurrent connects must not spawn twice"
+        assert not stale.exists(), "old screenshots should be cleaned on session start"
+
+
+# -- Screenshot directory ----------------------------------------------------
+
+
+class TestScreenshotDir:
+    def test_default_dir_is_private_home_location(self):
+        from spare_paw.tools import browser
+
+        assert str(browser.SCREENSHOT_DIR).startswith(str(Path.home()))
+        assert not str(browser.SCREENSHOT_DIR).startswith("/tmp")
+
+    def test_cleanup_removes_only_old_screenshots(self, tmp_path, monkeypatch):
+        from spare_paw.tools.browser import _cleanup_old_screenshots
+
+        monkeypatch.setattr("spare_paw.tools.browser.SCREENSHOT_DIR", tmp_path)
+        old = tmp_path / "screenshot_100.png"
+        old.write_bytes(b"old")
+        eight_days_ago = time.time() - 8 * 86400
+        os.utime(old, (eight_days_ago, eight_days_ago))
+        fresh = tmp_path / "screenshot_200.png"
+        fresh.write_bytes(b"new")
+
+        _cleanup_old_screenshots()
+
+        assert not old.exists()
+        assert fresh.exists()
+
+    def test_cleanup_missing_dir_is_noop(self, tmp_path, monkeypatch):
+        from spare_paw.tools.browser import _cleanup_old_screenshots
+
+        monkeypatch.setattr("spare_paw.tools.browser.SCREENSHOT_DIR", tmp_path / "missing")
+        _cleanup_old_screenshots()  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_screenshot_dir_created_with_0700(self, tmp_path, monkeypatch):
+        import base64
+
+        target = tmp_path / "shots"
+        monkeypatch.setattr("spare_paw.tools.browser.SCREENSHOT_DIR", target)
+        mock_session = _make_session_mock()
+        mock_session.send.return_value = {
+            "data": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
+        }
+
+        with patch("spare_paw.tools.browser._ensure_session", return_value=mock_session):
+            result = json.loads(await _handle_screenshot())
+
+        assert "path" in result
+        assert (target.stat().st_mode & 0o777) == 0o700
 
 
 # -- Navigate --------------------------------------------------------------

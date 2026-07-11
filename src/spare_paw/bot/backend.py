@@ -6,19 +6,23 @@ all I/O to the python-telegram-bot library.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import NetworkError, TimedOut
 
 from spare_paw.core.engine import split_text
 
 logger = logging.getLogger(__name__)
 
 _MAX_MESSAGE_LENGTH = 4096
+_SEND_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 1.0  # seconds: 1s, 2s, 4s
 
 # ---------------------------------------------------------------------------
 # Markdown → Telegram HTML conversion
@@ -149,54 +153,92 @@ class TelegramBackend:
     def set_app_state(self, app_state: Any) -> None:
         self._application.bot_data["app_state"] = app_state
 
+    async def _retry_send(
+        self, attempt: Callable[[], Awaitable[None]], description: str,
+    ) -> None:
+        """Run *attempt*, retrying transient network errors with backoff.
+
+        Up to ``_SEND_ATTEMPTS`` tries with exponential backoff (1s, 2s, 4s).
+        On final failure, logs at ERROR and re-raises so callers know the
+        delivery failed.
+        """
+        for i in range(_SEND_ATTEMPTS):
+            try:
+                await attempt()
+                return
+            except (NetworkError, TimedOut) as exc:
+                if i + 1 >= _SEND_ATTEMPTS:
+                    logger.error(
+                        "Failed to deliver %s after %d attempts: %s",
+                        description, _SEND_ATTEMPTS, exc,
+                    )
+                    raise
+                delay = _RETRY_BASE_DELAY * 2**i
+                logger.warning(
+                    "Transient error delivering %s (attempt %d/%d), retrying in %.0fs: %s",
+                    description, i + 1, _SEND_ATTEMPTS, delay, exc,
+                )
+                await asyncio.sleep(delay)
+
     async def send_text(self, text: str) -> None:
         if not text:
             text = "(empty response)"
 
         chunks = split_text(text, _MAX_MESSAGE_LENGTH)
         for chunk in chunks:
-            try:
-                html = md_to_html(chunk)
-                await self.bot.send_message(
-                    chat_id=self._chat_id,
-                    text=html,
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                await self.bot.send_message(
-                    chat_id=self._chat_id,
-                    text=chunk,
-                )
+
+            async def _attempt(chunk: str = chunk) -> None:
+                try:
+                    html = md_to_html(chunk)
+                    await self.bot.send_message(
+                        chat_id=self._chat_id,
+                        text=html,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    await self.bot.send_message(
+                        chat_id=self._chat_id,
+                        text=chunk,
+                    )
+
+            await self._retry_send(_attempt, f"text chunk ({len(chunk)} chars)")
 
     async def send_file(self, path: str, caption: str = "") -> None:
         fpath = Path(path)
         suffix = fpath.suffix.lower()
-        with open(fpath, "rb") as f:
-            if suffix in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-                await self.bot.send_photo(
-                    chat_id=self._chat_id, photo=f, caption=caption or None,
-                )
-            elif suffix in (".mp4", ".mov", ".avi"):
-                await self.bot.send_video(
-                    chat_id=self._chat_id, video=f, caption=caption or None,
-                )
-            elif suffix in (".mp3", ".ogg", ".m4a", ".wav"):
-                await self.bot.send_audio(
-                    chat_id=self._chat_id, audio=f, caption=caption or None,
-                )
-            else:
-                await self.bot.send_document(
-                    chat_id=self._chat_id, document=f, caption=caption or None,
-                )
+
+        async def _attempt() -> None:
+            with open(fpath, "rb") as f:
+                if suffix in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                    await self.bot.send_photo(
+                        chat_id=self._chat_id, photo=f, caption=caption or None,
+                    )
+                elif suffix in (".mp4", ".mov", ".avi"):
+                    await self.bot.send_video(
+                        chat_id=self._chat_id, video=f, caption=caption or None,
+                    )
+                elif suffix in (".mp3", ".ogg", ".m4a", ".wav"):
+                    await self.bot.send_audio(
+                        chat_id=self._chat_id, audio=f, caption=caption or None,
+                    )
+                else:
+                    await self.bot.send_document(
+                        chat_id=self._chat_id, document=f, caption=caption or None,
+                    )
+
+        await self._retry_send(_attempt, f"file {fpath.name}")
 
     async def send_voice(self, ogg_bytes: bytes) -> None:
         """Send raw opus/ogg bytes as a Telegram voice note."""
         from telegram import InputFile
 
-        await self.bot.send_voice(
-            chat_id=self._chat_id,
-            voice=InputFile(ogg_bytes, filename="voice.ogg"),
-        )
+        async def _attempt() -> None:
+            await self.bot.send_voice(
+                chat_id=self._chat_id,
+                voice=InputFile(ogg_bytes, filename="voice.ogg"),
+            )
+
+        await self._retry_send(_attempt, f"voice note ({len(ogg_bytes)} bytes)")
 
     async def send_typing(self) -> None:
         await self.bot.send_chat_action(

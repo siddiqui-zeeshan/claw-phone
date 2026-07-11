@@ -19,6 +19,8 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from spare_paw.util.redact import redact_secrets
+
 if TYPE_CHECKING:
     from spare_paw.tools.registry import ToolRegistry
 
@@ -26,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 CUSTOM_TOOLS_DIR = Path.home() / ".spare-paw" / "custom_tools"
 PENDING_DIR = CUSTOM_TOOLS_DIR / ".pending"
+
+# Only these parent env vars are passed through to custom tool scripts.
+# Everything else (API keys, tokens from systemd EnvironmentFile, ...) is withheld.
+_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR")
 
 # ---------------------------------------------------------------------------
 # Executor-compatible sync handler (top-level to avoid pickle errors)
@@ -44,15 +50,16 @@ def _execute_custom_tool(
     ``ProcessPoolExecutor``.  Parameters are passed to the script as
     environment variables.
     """
-    env = os.environ.copy()
+    env = {key: os.environ[key] for key in _ENV_ALLOWLIST if key in os.environ}
     for key, value in kwargs.items():
         env[f"TOOL_{key.upper()}"] = str(value)
 
+    params = ", ".join(f"{key}={value}" for key, value in kwargs.items())
     logger.info(
         "custom_tool: executing %s (timeout=%ds, params=%s)",
         script_path,
         timeout,
-        list(kwargs.keys()),
+        redact_secrets(params),
     )
 
     try:
