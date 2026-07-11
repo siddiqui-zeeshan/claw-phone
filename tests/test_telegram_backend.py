@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from telegram.error import NetworkError, TimedOut
 
 from spare_paw.backend import MessageBackend
 from spare_paw.bot.backend import TelegramBackend, md_to_html
@@ -242,6 +245,76 @@ class TestSendText:
         call_kwargs = bot.send_message.call_args
         text = call_kwargs.kwargs.get("text", call_kwargs[1].get("text", ""))
         assert text  # should send non-empty fallback
+
+
+class TestSendRetry:
+    @pytest.mark.asyncio
+    async def test_send_text_retries_on_network_error(self, monkeypatch):
+        backend, bot = _make_backend()
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        # Fail twice with a transient network error, then succeed.
+        bot.send_message.side_effect = [
+            NetworkError("connection reset"),
+            NetworkError("connection reset"),
+            None,
+        ]
+        await backend.send_text("hello")
+        assert bot.send_message.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_send_text_backoff_delays(self, monkeypatch):
+        backend, bot = _make_backend()
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        bot.send_message.side_effect = [
+            TimedOut(),
+            TimedOut(),
+            TimedOut(),
+            TimedOut(),
+            None,
+        ]
+        await backend.send_text("hello")
+        sleep_mock.assert_has_awaits([call(1.0), call(2.0)])
+
+    @pytest.mark.asyncio
+    async def test_send_text_raises_after_exhausted_retries(self, monkeypatch, caplog):
+        backend, bot = _make_backend()
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        bot.send_message.side_effect = NetworkError("network down")
+        with caplog.at_level(logging.ERROR, logger="spare_paw.bot.backend"):
+            with pytest.raises(NetworkError):
+                await backend.send_text("hello")
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert errors, "expected an ERROR log on final delivery failure"
+        assert any("5" in r.getMessage() for r in errors), "ERROR log should include chunk length"
+
+    @pytest.mark.asyncio
+    async def test_send_text_html_fallback_still_works(self, monkeypatch):
+        backend, bot = _make_backend()
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        # Non-network error on HTML send falls back to plain within one attempt.
+        bot.send_message.side_effect = [Exception("can't parse entities"), None]
+        await backend.send_text("hello")
+        assert bot.send_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_send_voice_retries_on_timeout(self, monkeypatch):
+        backend, bot = _make_backend()
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        bot.send_voice.side_effect = [TimedOut(), None]
+        await backend.send_voice(b"OggS fake voice data")
+        assert bot.send_voice.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_send_file_retries_on_network_error(self, monkeypatch, tmp_path):
+        backend, bot = _make_backend()
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        photo = tmp_path / "photo.jpg"
+        photo.write_bytes(b"\xff\xd8\xff")
+        bot.send_photo.side_effect = [NetworkError("connection reset"), None]
+        await backend.send_file(str(photo))
+        assert bot.send_photo.call_count == 2
 
 
 class TestSendFile:

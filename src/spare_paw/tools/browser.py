@@ -26,7 +26,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SCREENSHOT_DIR = Path("/tmp/spare-paw-screenshots")
+SCREENSHOT_DIR = Path.home() / ".spare-paw" / "screenshots"
+_SCREENSHOT_MAX_AGE_DAYS = 7
+
+
+def _ensure_screenshot_dir() -> Path:
+    """Create the screenshot directory (owner-only permissions) and return it."""
+    SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    SCREENSHOT_DIR.chmod(0o700)
+    return SCREENSHOT_DIR
+
+
+def _cleanup_old_screenshots(max_age_days: int = _SCREENSHOT_MAX_AGE_DAYS) -> None:
+    """Delete screenshots older than *max_age_days* so they don't pile up."""
+    if not SCREENSHOT_DIR.is_dir():
+        return
+    cutoff = time.time() - max_age_days * 86400
+    for path in SCREENSHOT_DIR.glob("screenshot_*.png"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            logger.debug("Could not remove old screenshot: %s", path)
 
 
 # -- CDP Session -----------------------------------------------------------
@@ -47,6 +68,7 @@ class BrowserSession:
         self._recv_task: asyncio.Task | None = None
         self._ws_url: str | None = None
         self._chromium_cmd: str | None = None
+        self._connect_lock = asyncio.Lock()
 
     @classmethod
     def get(cls) -> BrowserSession:
@@ -56,8 +78,14 @@ class BrowserSession:
 
     async def ensure_connected(self) -> None:
         """Launch Chromium and connect if not already running."""
-        if self._ws is not None and not self._ws.closed:
-            return
+        async with self._connect_lock:
+            if self._ws is not None and not self._ws.closed:
+                return
+            await self._connect()
+
+    async def _connect(self) -> None:
+        """Spawn Chromium and establish the CDP connection (lock held by caller)."""
+        _cleanup_old_screenshots()
 
         # Find Chromium binary
         if self._chromium_cmd is None:
@@ -71,13 +99,7 @@ class BrowserSession:
                 )
 
         # Kill any stale process
-        if self._process is not None:
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-            except Exception:
-                self._process.kill()
-            self._process = None
+        self._terminate_process()
 
         # Launch headless Chromium
         port = _find_free_port()
@@ -101,7 +123,12 @@ class BrowserSession:
 
         # Wait for DevTools to be ready
         cdp_base = f"http://127.0.0.1:{port}"
-        ws_url = await self._wait_for_devtools(cdp_base, timeout=15)
+        try:
+            ws_url = await self._wait_for_devtools(cdp_base, timeout=15)
+        except Exception:
+            # Don't leak the spawned process if DevTools never came up
+            self._terminate_process()
+            raise
         self._ws_url = ws_url
 
         # Connect WebSocket
@@ -135,6 +162,17 @@ class BrowserSession:
                 last_err = e
             await asyncio.sleep(0.5)
         raise RuntimeError(f"Chromium DevTools not ready after {timeout}s: {last_err}")
+
+    def _terminate_process(self) -> None:
+        """Terminate (or kill) the Chromium subprocess if one is running."""
+        if self._process is None:
+            return
+        try:
+            self._process.terminate()
+            self._process.wait(timeout=5)
+        except Exception:
+            self._process.kill()
+        self._process = None
 
     async def send(self, method: str, params: dict | None = None, timeout: float = 30) -> dict:
         """Send a CDP command and await the response."""
@@ -203,13 +241,7 @@ class BrowserSession:
             await self._http_session.close()
             self._http_session = None
 
-        if self._process is not None:
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-            except Exception:
-                self._process.kill()
-            self._process = None
+        self._terminate_process()
 
         self._pending.clear()
         self._events.clear()
@@ -332,9 +364,9 @@ async def _handle_screenshot(full_page: bool = False) -> str:
         )
         data = base64.b64decode(result["data"])
 
-        SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        shots_dir = _ensure_screenshot_dir()
         ts = int(time.time() * 1000)
-        path = SCREENSHOT_DIR / f"screenshot_{ts}.png"
+        path = shots_dir / f"screenshot_{ts}.png"
         path.write_bytes(data)
 
         return json.dumps({
