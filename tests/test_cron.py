@@ -38,7 +38,7 @@ def _make_app_state(**overrides) -> MagicMock:
 # CronScheduler CRUD
 # ---------------------------------------------------------------------------
 
-def _make_scheduler() -> CronScheduler:
+def _make_scheduler(job_defaults: dict | None = None) -> CronScheduler:
     """Create a CronScheduler with a real AsyncIOScheduler started in paused mode.
 
     Must be called from within a running event loop (i.e. inside an async test).
@@ -46,7 +46,10 @@ def _make_scheduler() -> CronScheduler:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
     sched = CronScheduler(MagicMock())
-    sched._scheduler = AsyncIOScheduler()
+    if job_defaults is not None:
+        sched._scheduler = AsyncIOScheduler(job_defaults=job_defaults)
+    else:
+        sched._scheduler = AsyncIOScheduler()
     sched._scheduler.start(paused=True)
     return sched
 
@@ -129,6 +132,134 @@ class TestCronSchedulerCRUD:
 
 
 # ---------------------------------------------------------------------------
+# Missed-job semantics and overlap prevention
+# ---------------------------------------------------------------------------
+
+
+class TestCronJobRobustness:
+    """Jobs must carry explicit misfire/coalesce/max_instances settings.
+
+    Settings must be set per-job rather than inherited from whatever the
+    scheduler's job_defaults happen to be — so a job missed while the
+    process was down runs once on restart, and slow runs can't overlap.
+    """
+
+    @pytest.mark.asyncio
+    async def test_add_job_sets_explicit_misfire_settings(self):
+        # Hostile job_defaults: if add_job relies on scheduler defaults,
+        # these leak through and the assertions below fail.
+        scheduler = _make_scheduler(
+            job_defaults={"misfire_grace_time": 30, "coalesce": False, "max_instances": 3}
+        )
+        try:
+            await scheduler.add_job("job-robust", "*/5 * * * *", "do something")
+            job = scheduler._scheduler.get_job("job-robust")
+            assert job.misfire_grace_time == 3600
+            assert job.coalesce is True
+            assert job.max_instances == 1
+        finally:
+            scheduler._scheduler.shutdown(wait=False)
+
+    @pytest.mark.asyncio
+    async def test_start_schedules_db_jobs_with_explicit_misfire_settings(self):
+        rows = [
+            {
+                "id": "db-job-1",
+                "schedule": "59 23 31 12 *",
+                "prompt": "yearly task",
+                "model": None,
+                "tools_allowed": None,
+            }
+        ]
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=rows)
+        mock_ctx = MagicMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_cursor)
+        mock_ctx.__aexit__ = AsyncMock(return_value=False)
+        mock_db = MagicMock()
+        mock_db.execute = MagicMock(return_value=mock_ctx)
+
+        scheduler = CronScheduler(_make_app_state())
+        with patch("spare_paw.cron.scheduler.get_db", AsyncMock(return_value=mock_db)):
+            await scheduler.start()
+        try:
+            job = scheduler._scheduler.get_job("db-job-1")
+            assert job is not None
+            assert job.misfire_grace_time == 3600
+            assert job.coalesce is True
+            assert job.max_instances == 1
+        finally:
+            await scheduler.stop()
+
+
+# ---------------------------------------------------------------------------
+# Explicit timezone
+# ---------------------------------------------------------------------------
+
+
+def _app_state_with_tz(tz_name: str) -> MagicMock:
+    """Mock AppState whose config returns tz_name for cron.timezone."""
+    app_state = _make_app_state()
+    orig = app_state.config.get.side_effect
+    app_state.config.get = MagicMock(
+        side_effect=lambda key, default=None: (
+            tz_name if key == "cron.timezone" else orig(key, default)
+        )
+    )
+    return app_state
+
+
+class TestCronTimezone:
+    """CronTrigger must be built with an explicit timezone."""
+
+    @pytest.mark.asyncio
+    async def test_add_job_uses_configured_timezone(self):
+        from zoneinfo import ZoneInfo
+
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+        sched = CronScheduler(_app_state_with_tz("Pacific/Kiritimati"))
+        sched._scheduler = AsyncIOScheduler()
+        sched._scheduler.start(paused=True)
+        try:
+            await sched.add_job("job-tz", "0 9 * * *", "morning task")
+            job = sched._scheduler.get_job("job-tz")
+            assert job.trigger.timezone == ZoneInfo("Pacific/Kiritimati")
+        finally:
+            sched._scheduler.shutdown(wait=False)
+
+    @pytest.mark.asyncio
+    async def test_add_job_falls_back_to_explicit_system_local_timezone(self):
+        from datetime import datetime
+
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+        sched = CronScheduler(_make_app_state())  # no cron.timezone configured
+        sched._scheduler = AsyncIOScheduler()
+        sched._scheduler.start(paused=True)
+        try:
+            await sched.add_job("job-tz-local", "0 9 * * *", "morning task")
+            job = sched._scheduler.get_job("job-tz-local")
+            assert job.trigger.timezone == datetime.now().astimezone().tzinfo
+        finally:
+            sched._scheduler.shutdown(wait=False)
+
+    @pytest.mark.asyncio
+    async def test_invalid_timezone_falls_back_to_local(self):
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+        sched = CronScheduler(_app_state_with_tz("Not/AZone"))
+        sched._scheduler = AsyncIOScheduler()
+        sched._scheduler.start(paused=True)
+        try:
+            await sched.add_job("job-tz-bad", "0 9 * * *", "morning task")
+            job = sched._scheduler.get_job("job-tz-bad")
+            assert job is not None  # bad config must not break scheduling
+        finally:
+            sched._scheduler.shutdown(wait=False)
+
+
+# ---------------------------------------------------------------------------
 # execute_cron — success path
 # ---------------------------------------------------------------------------
 
@@ -136,10 +267,14 @@ class TestExecuteCronSuccess:
     """Test execute_cron sends the result to Telegram on success."""
 
     @pytest.mark.asyncio
-    @patch("spare_paw.cron.executor._maybe_delete_once", new_callable=AsyncMock)
+    @patch(
+        "spare_paw.cron.executor._claim_one_shot",
+        new_callable=AsyncMock,
+        return_value=(False, {}),
+    )
     @patch("spare_paw.cron.executor._update_cron_result", new_callable=AsyncMock)
     @patch("spare_paw.cron.executor.run_tool_loop", new_callable=AsyncMock)
-    async def test_sends_result_to_telegram(self, mock_tool_loop, mock_update, _mock_delete):
+    async def test_sends_result_to_telegram(self, mock_tool_loop, mock_update, _mock_claim):
         from spare_paw.cron.executor import execute_cron
 
         mock_tool_loop.return_value = "Cron result text"
@@ -171,10 +306,14 @@ class TestExecuteCronError:
     """Test execute_cron handles errors and sends warning message."""
 
     @pytest.mark.asyncio
-    @patch("spare_paw.cron.executor._maybe_delete_once", new_callable=AsyncMock)
+    @patch(
+        "spare_paw.cron.executor._claim_one_shot",
+        new_callable=AsyncMock,
+        return_value=(False, {}),
+    )
     @patch("spare_paw.cron.executor._update_cron_result", new_callable=AsyncMock)
     @patch("spare_paw.cron.executor.run_tool_loop", new_callable=AsyncMock)
-    async def test_sends_warning_on_failure(self, mock_tool_loop, mock_update, _mock_delete):
+    async def test_sends_warning_on_failure(self, mock_tool_loop, mock_update, _mock_claim):
         from spare_paw.cron.executor import execute_cron
 
         mock_tool_loop.side_effect = RuntimeError("model exploded")
@@ -198,10 +337,14 @@ class TestExecuteCronError:
         )
 
     @pytest.mark.asyncio
-    @patch("spare_paw.cron.executor._maybe_delete_once", new_callable=AsyncMock)
+    @patch(
+        "spare_paw.cron.executor._claim_one_shot",
+        new_callable=AsyncMock,
+        return_value=(False, {}),
+    )
     @patch("spare_paw.cron.executor._update_cron_result", new_callable=AsyncMock)
     @patch("spare_paw.cron.executor.run_tool_loop", new_callable=AsyncMock)
-    async def test_error_notification_failure_does_not_propagate(self, mock_tool_loop, mock_update, _mock_delete):  # noqa: E501
+    async def test_error_notification_failure_does_not_propagate(self, mock_tool_loop, mock_update, _mock_claim):  # noqa: E501
         """If sending the error notification itself fails, execute_cron still doesn't raise."""
         from spare_paw.cron.executor import execute_cron
 
@@ -220,35 +363,40 @@ class TestExecuteCronError:
 
 
 # ---------------------------------------------------------------------------
-# One-shot auto-delete
+# One-shot crash safety (claim-then-run)
 # ---------------------------------------------------------------------------
 
 
-class TestOneShotCronAutoDelete:
-    """Test _maybe_delete_once auto-deletes crons with metadata.once=true."""
+def _make_mock_db(row, rowcount: int = 1, events: list[str] | None = None) -> MagicMock:
+    """Mock aiosqlite DB: fetchone returns `row`; DELETEs are recorded in `events`."""
+    mock_cursor = AsyncMock()
+    mock_cursor.fetchone = AsyncMock(return_value=row)
+    mock_cursor.rowcount = rowcount
+
+    async def _execute(sql, *args, **kwargs):
+        if events is not None and "DELETE" in sql:
+            events.append("delete")
+        return mock_cursor
+
+    mock_db = MagicMock()
+    mock_db.execute = AsyncMock(side_effect=_execute)
+    mock_db.commit = AsyncMock()
+    return mock_db
+
+
+class TestClaimOneShot:
+    """_claim_one_shot consumes the row of once=true crons before execution."""
 
     @pytest.mark.asyncio
-    async def test_one_shot_cron_auto_deletes(self):
-        """A cron with metadata={"once": true} should be deleted after execution."""
-        from spare_paw.cron.executor import _maybe_delete_once
+    async def test_claims_and_deletes_once_cron(self):
+        from spare_paw.cron.executor import _claim_one_shot
 
-        # Build a mock DB that returns a row with once=true metadata
-        mock_row = {"metadata": '{"once": true}'}
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchone = AsyncMock(return_value=mock_row)
+        mock_db = _make_mock_db({"metadata": '{"once": true}'})
+        with patch("spare_paw.cron.executor.get_db", AsyncMock(return_value=mock_db)):
+            once, metadata = await _claim_one_shot("cron-once-1")
 
-        mock_db = AsyncMock()
-        mock_db.execute = AsyncMock(return_value=mock_cursor)
-        mock_db.commit = AsyncMock()
-
-        app_state = _make_app_state()
-        app_state.scheduler = AsyncMock()
-        app_state.scheduler.remove_job = AsyncMock()
-
-        with patch("spare_paw.cron.executor.get_db", return_value=mock_db):
-            await _maybe_delete_once(app_state, "cron-once-1")
-
-        # Verify DELETE was issued
+        assert once is True
+        assert metadata == {"once": True}
         delete_calls = [
             call for call in mock_db.execute.call_args_list
             if "DELETE" in str(call)
@@ -256,27 +404,119 @@ class TestOneShotCronAutoDelete:
         assert len(delete_calls) == 1
         assert "cron-once-1" in str(delete_calls[0])
 
-        # Verify scheduler was notified
-        app_state.scheduler.remove_job.assert_awaited_once_with("cron-once-1")
-
     @pytest.mark.asyncio
     async def test_non_once_cron_is_not_deleted(self):
         """A cron without once=true in metadata should NOT be deleted."""
-        from spare_paw.cron.executor import _maybe_delete_once
+        from spare_paw.cron.executor import _claim_one_shot
 
-        mock_row = {"metadata": '{"repeat": true}'}
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchone = AsyncMock(return_value=mock_row)
+        mock_db = _make_mock_db({"metadata": '{"repeat": true}'})
+        with patch("spare_paw.cron.executor.get_db", AsyncMock(return_value=mock_db)):
+            once, metadata = await _claim_one_shot("cron-repeat")
 
-        mock_db = AsyncMock()
-        mock_db.execute = AsyncMock(return_value=mock_cursor)
+        assert once is False
+        assert metadata == {"repeat": True}
+        assert "DELETE" not in str(mock_db.execute.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_missing_row_reports_already_claimed(self):
+        from spare_paw.cron.executor import _claim_one_shot
+
+        mock_db = _make_mock_db(None)
+        with patch("spare_paw.cron.executor.get_db", AsyncMock(return_value=mock_db)):
+            once, _metadata = await _claim_one_shot("cron-gone")
+
+        assert once is None
+
+    @pytest.mark.asyncio
+    async def test_lost_delete_race_reports_already_claimed(self):
+        """If the DELETE claims no row, another run already consumed the cron."""
+        from spare_paw.cron.executor import _claim_one_shot
+
+        mock_db = _make_mock_db({"metadata": '{"once": true}'}, rowcount=0)
+        with patch("spare_paw.cron.executor.get_db", AsyncMock(return_value=mock_db)):
+            once, _metadata = await _claim_one_shot("cron-raced")
+
+        assert once is None
+
+
+class TestOneShotClaimThenRun:
+    """One-shot crons are consumed from the DB BEFORE their work executes.
+
+    Deleting the row after execution means a crash after the work (or a
+    restart mid-run) fires the job twice; claiming first makes that impossible.
+    """
+
+    @pytest.mark.asyncio
+    @patch("spare_paw.cron.executor._update_cron_result", new_callable=AsyncMock)
+    @patch("spare_paw.cron.executor.run_tool_loop", new_callable=AsyncMock)
+    async def test_row_deleted_before_work_executes(self, mock_tool_loop, _mock_update):
+        from spare_paw.cron.executor import execute_cron
+
+        events: list[str] = []
+        mock_db = _make_mock_db({"metadata": '{"once": true}'}, events=events)
+
+        async def record_work(*args, **kwargs):
+            events.append("work")
+            return "one-shot result"
+
+        mock_tool_loop.side_effect = record_work
 
         app_state = _make_app_state()
         app_state.scheduler = AsyncMock()
 
-        with patch("spare_paw.cron.executor.get_db", return_value=mock_db):
-            await _maybe_delete_once(app_state, "cron-repeat")
+        with patch("spare_paw.cron.executor.get_db", AsyncMock(return_value=mock_db)):
+            await execute_cron(app_state, "cron-once", "do it", None, None)
 
-        # Only the SELECT should have been called, no DELETE
-        calls_str = str(mock_db.execute.call_args_list)
-        assert "DELETE" not in calls_str
+        assert "delete" in events and "work" in events, events
+        assert events.index("delete") < events.index("work"), events
+
+    @pytest.mark.asyncio
+    @patch("spare_paw.cron.executor._update_cron_result", new_callable=AsyncMock)
+    @patch("spare_paw.cron.executor.run_tool_loop", new_callable=AsyncMock)
+    async def test_skipped_when_row_already_gone(self, mock_tool_loop, _mock_update):
+        """If the cron row is already gone (consumed or deleted), do not execute."""
+        from spare_paw.cron.executor import execute_cron
+
+        mock_db = _make_mock_db(None)
+        app_state = _make_app_state()
+        app_state.scheduler = AsyncMock()
+
+        with patch("spare_paw.cron.executor.get_db", AsyncMock(return_value=mock_db)):
+            await execute_cron(app_state, "cron-gone", "do it", None, None)
+
+        mock_tool_loop.assert_not_awaited()
+        app_state.backend.send_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("spare_paw.cron.executor._update_cron_result", new_callable=AsyncMock)
+    @patch("spare_paw.cron.executor.run_tool_loop", new_callable=AsyncMock)
+    async def test_skipped_when_claim_loses_race(self, mock_tool_loop, _mock_update):
+        """If the DELETE claims no row, another run owns the job — skip."""
+        from spare_paw.cron.executor import execute_cron
+
+        mock_db = _make_mock_db({"metadata": '{"once": true}'}, rowcount=0)
+        app_state = _make_app_state()
+        app_state.scheduler = AsyncMock()
+
+        with patch("spare_paw.cron.executor.get_db", AsyncMock(return_value=mock_db)):
+            await execute_cron(app_state, "cron-raced", "do it", None, None)
+
+        mock_tool_loop.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("spare_paw.cron.executor._update_cron_result", new_callable=AsyncMock)
+    @patch("spare_paw.cron.executor.run_tool_loop", new_callable=AsyncMock)
+    async def test_scheduler_cleanup_runs_even_on_failure(self, mock_tool_loop, _mock_update):
+        """The scheduler.remove_job cleanup stays in a finally block."""
+        from spare_paw.cron.executor import execute_cron
+
+        mock_db = _make_mock_db({"metadata": '{"once": true}'})
+        mock_tool_loop.side_effect = RuntimeError("model exploded")
+
+        app_state = _make_app_state()
+        app_state.scheduler = AsyncMock()
+
+        with patch("spare_paw.cron.executor.get_db", AsyncMock(return_value=mock_db)):
+            await execute_cron(app_state, "cron-once-f", "do it", None, None)
+
+        app_state.scheduler.remove_job.assert_awaited_once_with("cron-once-f")

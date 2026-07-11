@@ -33,6 +33,8 @@ async def execute_cron(
     """Execute a cron job: run the prompt through the tool loop and send the result to the owner.
 
     Steps:
+        0. Claim one-shot (once=true) crons: delete the row BEFORE running so
+           a crash after execution can never fire them twice (claim-then-run).
         1. Resolve model (cron-specific → cron_default → default).
         2. Build messages with system prompt + user prompt.
         3. Get tool schemas, filtered by tools_allowed if set.
@@ -42,30 +44,30 @@ async def execute_cron(
     """
     now = datetime.now(timezone.utc).isoformat()
 
-    # Check if this is a dream cron — handle it directly without the full tool loop
-    try:
-        db = await get_db()
-        cursor = await db.execute(
-            "SELECT metadata FROM cron_jobs WHERE id = ?", (cron_id,)
-        )
-        row = await cursor.fetchone()
-        metadata_str = row["metadata"] if row else None
-        metadata = json.loads(metadata_str) if metadata_str else {}
-        if metadata.get("dream"):
-            from spare_paw.tools.dream import run_dream
-
-            result = await run_dream(app_state)
-            # Send result notification
-            backend = getattr(app_state, "backend", None)
-            if backend is not None:
-                await backend.send_text(result)
-            await _update_cron_result(cron_id, now, result=result)
-            logger.info("Dream cron %s executed successfully", cron_id)
-            return
-    except Exception as exc:
-        logger.debug("Dream cron check failed for %s: %s", cron_id, exc, exc_info=True)
+    # Claim one-shot crons BEFORE any work executes.  once is None when the
+    # row is already gone (consumed by a previous run or deleted) — skip.
+    once, metadata = await _claim_one_shot(cron_id)
+    if once is None:
+        logger.info("Cron %s row already gone, skipping execution", cron_id)
+        return
 
     try:
+        # Check if this is a dream cron — handle it directly without the full tool loop
+        try:
+            if metadata.get("dream"):
+                from spare_paw.tools.dream import run_dream
+
+                result = await run_dream(app_state)
+                # Send result notification
+                backend = getattr(app_state, "backend", None)
+                if backend is not None:
+                    await backend.send_text(result)
+                await _update_cron_result(cron_id, now, result=result)
+                logger.info("Dream cron %s executed successfully", cron_id)
+                return
+        except Exception as exc:
+            logger.debug("Dream cron check failed for %s: %s", cron_id, exc, exc_info=True)
+
         # 1. Resolve model (per-job override → cron role → main_agent)
         resolved_model = model or resolve_model(app_state.config, "cron")
 
@@ -144,8 +146,10 @@ async def execute_cron(
         await _update_cron_result(cron_id, now, error=error_msg)
 
     finally:
-        # Auto-delete one-shot crons regardless of success/failure
-        await _maybe_delete_once(app_state, cron_id)
+        # One-shot crons: the DB row was already consumed by the claim above;
+        # remove the job from the running scheduler regardless of outcome.
+        if once:
+            await _remove_one_shot_from_scheduler(app_state, cron_id)
 
 
 async def _update_cron_result(
@@ -172,21 +176,46 @@ async def _update_cron_result(
         logger.exception("Failed to update cron_jobs for %s", cron_id)
 
 
-async def _maybe_delete_once(app_state: Any, cron_id: str) -> None:
-    """Delete a cron job if it has once=true in its metadata."""
+async def _claim_one_shot(cron_id: str) -> tuple[bool | None, dict[str, Any]]:
+    """Claim a one-shot cron before execution (claim-then-run).
+
+    One-shot (once=true) rows are deleted BEFORE the job's work runs, so a
+    crash after execution — or a restart mid-run — can never fire them twice.
+
+    Returns (once, metadata):
+        (False, metadata) — not a one-shot job, proceed normally.
+        (True, metadata)  — one-shot job claimed (row deleted), this call owns the run.
+        (None, {})        — row already gone or claim lost, skip execution.
+    """
     try:
         db = await get_db()
         cursor = await db.execute(
             "SELECT metadata FROM cron_jobs WHERE id = ?", (cron_id,)
         )
         row = await cursor.fetchone()
-        if row and row["metadata"]:
-            meta = json.loads(row["metadata"])
-            if meta.get("once"):
-                await db.execute("DELETE FROM cron_jobs WHERE id = ?", (cron_id,))
-                await db.commit()
-                if app_state.scheduler:
-                    await app_state.scheduler.remove_job(cron_id)
-                logger.info("One-shot cron %s auto-deleted", cron_id)
+        if row is None:
+            return None, {}
+        metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+        if not metadata.get("once"):
+            return False, metadata
+        cursor = await db.execute("DELETE FROM cron_jobs WHERE id = ?", (cron_id,))
+        await db.commit()
+        if cursor.rowcount == 0:
+            # Another run claimed the row between the SELECT and the DELETE.
+            return None, {}
+        logger.info("One-shot cron %s claimed (row deleted before run)", cron_id)
+        return True, metadata
     except Exception:
-        logger.exception("Failed to auto-delete one-shot cron %s", cron_id)
+        logger.exception("Failed to claim one-shot cron %s", cron_id)
+        return False, {}
+
+
+async def _remove_one_shot_from_scheduler(app_state: Any, cron_id: str) -> None:
+    """Remove a consumed one-shot cron from the running scheduler."""
+    try:
+        scheduler = getattr(app_state, "scheduler", None)
+        if scheduler:
+            await scheduler.remove_job(cron_id)
+        logger.info("One-shot cron %s removed after run", cron_id)
+    except Exception:
+        logger.exception("Failed to remove one-shot cron %s from scheduler", cron_id)
