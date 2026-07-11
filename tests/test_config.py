@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
 import yaml
 
 from spare_paw.config import (
@@ -114,6 +115,24 @@ class TestConfigLoad:
         cfg = Config()
         cfg.load(cfg_file)
         assert cfg.get("agent.max_tool_iterations") == DEFAULTS["agent"]["max_tool_iterations"]
+
+    def test_load_malformed_yaml_raises_clear_error(self, tmp_path: Path):
+        """Malformed YAML must fail fast with a RuntimeError naming the file."""
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("logging: [unclosed\n")
+        cfg = Config()
+        with pytest.raises(RuntimeError) as excinfo:
+            cfg.load(cfg_file)
+        assert str(cfg_file) in str(excinfo.value)
+
+    def test_load_non_dict_yaml_raises_clear_error(self, tmp_path: Path):
+        """A YAML file that parses to a non-dict must fail fast with a clear error."""
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("just a bare string\n")
+        cfg = Config()
+        with pytest.raises(RuntimeError) as excinfo:
+            cfg.load(cfg_file)
+        assert str(cfg_file) in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------

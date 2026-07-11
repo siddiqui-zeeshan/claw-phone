@@ -147,12 +147,28 @@ class Config:
         self._overrides: dict[str, Any] = {}
 
     def load(self, path: Path | None = None) -> None:
-        """Load config from YAML file, deep-merging with defaults."""
+        """Load config from YAML file, deep-merging with defaults.
+
+        Raises RuntimeError if the file is malformed YAML or does not contain
+        a mapping — fail fast rather than silently running without the file's
+        settings (it holds the API key).
+        """
         path = path or CONFIG_PATH
         with self._lock:
             if path.exists():
-                with open(path, "r") as f:
-                    file_data = yaml.safe_load(f) or {}
+                try:
+                    with open(path, "r") as f:
+                        file_data = yaml.safe_load(f) or {}
+                except yaml.YAMLError as exc:
+                    raise RuntimeError(
+                        f"Failed to parse config file {path}: {exc}\n"
+                        "Fix the YAML syntax (or restore the file from backup) and restart."
+                    ) from exc
+                if not isinstance(file_data, dict):
+                    raise RuntimeError(
+                        f"Config file {path} must contain a YAML mapping of settings, "
+                        f"got {type(file_data).__name__}. Fix the file and restart."
+                    )
                 self._data = _deep_merge(DEFAULTS, file_data)
             else:
                 self._data = copy.deepcopy(DEFAULTS)

@@ -68,6 +68,18 @@ LCM_DESCRIBE_SCHEMA: dict[str, Any] = {
 # -- Handlers --------------------------------------------------------------
 
 
+def _parse_source_msg_ids(row: Any) -> list[str]:
+    """Parse a summary node's source_msg_ids JSON, defaulting to [] if corrupted."""
+    try:
+        return json.loads(row["source_msg_ids"])
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(
+            "Invalid JSON in summary_nodes.source_msg_ids for node %s — treating as empty",
+            row["id"],
+        )
+        return []
+
+
 async def _handle_lcm_grep(query: str, limit: int = 10) -> str:
     """Search both messages and summary_nodes via FTS5."""
     db = await get_db()
@@ -137,7 +149,7 @@ async def _handle_lcm_expand(summary_id: str, max_tokens: int = 4000) -> str:
     if node is None:
         return json.dumps({"error": f"Summary node not found: {summary_id}"})
 
-    source_msg_ids = json.loads(node["source_msg_ids"])
+    source_msg_ids = _parse_source_msg_ids(node)
     total_source_messages = len(source_msg_ids)
 
     if not source_msg_ids:
@@ -225,7 +237,7 @@ async def _handle_lcm_describe(
             "depth": row["depth"],
             "content": row["content"],
             "token_count": row["token_count"],
-            "source_msg_ids": json.loads(row["source_msg_ids"]),
+            "source_msg_ids": _parse_source_msg_ids(row),
             "created_at": row["created_at"],
         }
         for row in rows

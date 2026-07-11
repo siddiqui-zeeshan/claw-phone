@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -123,6 +124,66 @@ async def test_source_messages_preserved_on_failure(_init_db):
 
 
 @pytest.mark.asyncio
+async def test_condense_failure_leaves_no_orphaned_node(_init_db, monkeypatch):
+    """A crash between the condensed-node INSERT and the leaf UPDATEs must roll back.
+
+    Without an explicit transaction, the pending INSERT would be persisted by
+    the next unrelated commit on the shared connection, leaving an orphaned
+    condensed node whose leaves don't point to it.
+    """
+    from spare_paw.context import _condense_summaries
+
+    conn = _init_db
+    conv_id = await new_conversation()
+
+    # Pre-create 4 orphan leaves (enough to trigger condensation)
+    now = datetime.now(timezone.utc).isoformat()
+    for i in range(4):
+        await conn.execute(
+            """INSERT INTO summary_nodes
+               (id, conversation_id, parent_id, depth, content, token_count, source_msg_ids, created_at)
+               VALUES (?, ?, NULL, 0, ?, 10, '[]', ?)""",
+            (f"leaf-{i}", conv_id, f"Leaf summary {i}", now),
+        )
+    await conn.commit()
+
+    mock_client = _make_mock_router_client("Condensed summary.")
+
+    # Fail on the first parent-pointer UPDATE (i.e. right after the INSERT)
+    real_execute = conn.execute
+
+    def failing_execute(sql, *args, **kwargs):
+        if sql.lstrip().startswith("UPDATE summary_nodes SET parent_id"):
+            raise RuntimeError("simulated crash between INSERT and UPDATE")
+        return real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(conn, "execute", failing_execute)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await _condense_summaries(conv_id, mock_client, "test-model")
+
+    monkeypatch.undo()
+
+    # Simulate a later unrelated commit on the shared connection
+    await conn.commit()
+
+    async with conn.execute(
+        "SELECT COUNT(*) FROM summary_nodes WHERE conversation_id = ? AND depth = 1",
+        (conv_id,),
+    ) as cur:
+        orphaned = (await cur.fetchone())[0]
+    assert orphaned == 0, "Failed condensation must not leave an orphaned condensed node"
+
+    # All leaves must still be parentless (available for the next condensation)
+    async with conn.execute(
+        "SELECT COUNT(*) FROM summary_nodes WHERE conversation_id = ? AND depth = 0 AND parent_id IS NULL",
+        (conv_id,),
+    ) as cur:
+        leaves = (await cur.fetchone())[0]
+    assert leaves == 4
+
+
+@pytest.mark.asyncio
 async def test_consecutive_failure_counter_increments(_init_db):
     """Each double-failure cycle should increment the consecutive failure counter."""
     from spare_paw.config import config as config_mod
@@ -172,8 +233,8 @@ async def test_consecutive_failure_counter_resets_on_success(_init_db):
 
 
 @pytest.mark.asyncio
-async def test_warning_fires_after_three_consecutive_failures(_init_db):
-    """A distinct WARNING should be logged after 3+ consecutive failures."""
+async def test_error_escalation_at_consecutive_failure_threshold(_init_db):
+    """A distinct ERROR should be logged once failures reach the escalation threshold."""
     import logging
     from spare_paw.config import config as config_mod
 
@@ -186,31 +247,41 @@ async def test_warning_fires_after_three_consecutive_failures(_init_db):
     mock_client = _make_mock_router_client()
     mock_client.chat.side_effect = Exception("always fails")
 
-    warning_messages: list[str] = []
+    error_messages: list[str] = []
 
     class CapturingHandler(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
-            if record.levelno == logging.WARNING:
-                warning_messages.append(record.getMessage())
+            if record.levelno == logging.ERROR:
+                error_messages.append(record.getMessage())
 
     handler = CapturingHandler()
     ctx_logger = logging.getLogger("spare_paw.context")
     ctx_logger.addHandler(handler)
 
+    threshold = ctx_mod._COMPACT_FAILURE_ESCALATION_THRESHOLD
+
+    def _escalations() -> list[str]:
+        return [m for m in error_messages if "times consecutively" in m]
+
     try:
-        for _ in range(3):
+        # Below the threshold: no escalation yet
+        for _ in range(threshold - 1):
             with patch("asyncio.sleep", new_callable=AsyncMock):
                 await compact_with_retry(conv_id, mock_client, "test-model")
+        assert _escalations() == [], "Escalation must not fire below the threshold"
+
+        # The failure cycle that reaches the threshold triggers the escalation
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await compact_with_retry(conv_id, mock_client, "test-model")
     finally:
         ctx_logger.removeHandler(handler)
 
-    threshold_warnings = [
-        m for m in warning_messages if "3+ times consecutively" in m
-    ]
-    assert len(threshold_warnings) >= 1, (
-        "Expected a WARNING about 3+ consecutive failures, got: " + str(warning_messages)
+    escalations = _escalations()
+    assert len(escalations) == 1, (
+        "Expected exactly one escalation ERROR at the threshold, got: " + str(error_messages)
     )
+    assert str(threshold) in escalations[0], "Escalation must include the failure count"
 
-    assert ctx_mod._compact_consecutive_failures.get(conv_id, 0) == 3
+    assert ctx_mod._compact_consecutive_failures.get(conv_id, 0) == threshold
 
     config_mod.set_override("context.fresh_tail_count", 32)
