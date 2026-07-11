@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from spare_paw.router.tool_loop import run_tool_loop
+from spare_paw.router.tool_loop import ToolLoopResult, run_tool_loop
 from tests._stream_helpers import FakeStreamingClient, response_to_chunks
 
 
@@ -226,3 +226,147 @@ class TestStructuredLogging:
         warning_logs = [r for r in caplog.records if r.levelno >= logging.WARNING]
         budget_warnings = [r for r in warning_logs if "token" in r.message.lower() and "budget" in r.message.lower()]
         assert len(budget_warnings) > 0
+
+
+class TestStructuredOutcome:
+    """Audit fix: loop failures must be distinguishable from real replies."""
+
+    @pytest.mark.asyncio
+    async def test_ok_outcome(self):
+        client = FakeStreamingClient([_chunks(content="Final answer")])
+        registry = AsyncMock()
+
+        result = await run_tool_loop(
+            client=client,
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[],
+            tool_registry=registry,
+            return_result=True,
+        )
+
+        assert isinstance(result, ToolLoopResult)
+        assert result.outcome == "ok"
+        assert result.text == "Final answer"
+        assert result.usage["total_tokens"] == 15
+
+    @pytest.mark.asyncio
+    async def test_llm_timeout_outcome(self):
+        class _SlowStreamClient:
+            async def chat_stream(self, messages, model, tools=None):
+                await asyncio.sleep(999)
+                if False:  # pragma: no cover — makes this an async generator
+                    yield None
+
+        registry = AsyncMock()
+        result = await run_tool_loop(
+            client=_SlowStreamClient(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[],
+            tool_registry=registry,
+            llm_timeout=0.05,
+            return_result=True,
+        )
+
+        assert result.outcome == "llm_timeout"
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_outcome(self):
+        client = FakeStreamingClient([
+            _chunks(
+                tool_calls=[_tool_call_dict("shell", {"command": "x"})],
+                usage={"prompt_tokens": 30000, "completion_tokens": 10000, "total_tokens": 40000},
+            ),
+        ])
+        registry = AsyncMock()
+        registry.execute = AsyncMock(return_value="ok")
+
+        result = await run_tool_loop(
+            client=client,
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "shell"}}],
+            tool_registry=registry,
+            token_budget=30000,
+            return_result=True,
+        )
+
+        assert result.outcome == "budget_exhausted"
+
+    @pytest.mark.asyncio
+    async def test_max_iterations_fallback_error_outcome(self):
+        """When even the final no-tools summary call fails, outcome is max_iterations."""
+        client = FakeStreamingClient([
+            _chunks(tool_calls=[_tool_call_dict("shell", {"command": "x"})]),
+        ])
+        client.chat = AsyncMock(side_effect=RuntimeError("api down"))
+        registry = AsyncMock()
+        registry.execute = AsyncMock(return_value="ok")
+
+        result = await run_tool_loop(
+            client=client,
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "shell"}}],
+            tool_registry=registry,
+            max_iterations=1,
+            return_result=True,
+        )
+
+        assert result.outcome == "max_iterations"
+
+    @pytest.mark.asyncio
+    async def test_max_iterations_with_successful_summary_is_ok(self):
+        """The forced final summary is a legitimate model reply, not an error."""
+        client = FakeStreamingClient([
+            _chunks(tool_calls=[_tool_call_dict("shell", {"command": "x"})]),
+        ])
+        registry = AsyncMock()
+        registry.execute = AsyncMock(return_value="ok")
+
+        result = await run_tool_loop(
+            client=client,
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "shell"}}],
+            tool_registry=registry,
+            max_iterations=1,
+            return_result=True,
+        )
+
+        assert result.outcome == "ok"
+        assert result.text == "fallback"
+
+
+class TestPerToolTimeoutOverrides:
+    @pytest.mark.asyncio
+    async def test_consult_main_gets_extended_timeout(self):
+        """consult_main needs an LLM round-trip; the generic tool timeout must not apply."""
+        client = FakeStreamingClient([
+            _chunks(tool_calls=[_tool_call_dict("consult_main", {"question": "q"})]),
+            _chunks(content="done"),
+        ])
+
+        registry = AsyncMock()
+
+        async def slow_consult(name, args, executor=None):
+            await asyncio.sleep(0.3)
+            return "answer"
+
+        registry.execute = slow_consult
+
+        messages: list[dict] = [{"role": "user", "content": "hi"}]
+        result = await run_tool_loop(
+            client=client,
+            messages=messages,
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "consult_main"}}],
+            tool_registry=registry,
+            tool_timeout=0.05,
+        )
+
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert "timed out" not in tool_msgs[0]["content"].lower()
+        assert result == "done"

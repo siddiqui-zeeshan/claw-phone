@@ -45,6 +45,24 @@ _agents: dict[str, dict[str, Any]] = {}
 _MAX_CONCURRENT = 10
 _MAX_PER_GROUP = 5  # max agents in a single group/batch
 
+# Groups whose completion callback has already been claimed (single-flight).
+_notified_groups: set[str] = set()
+
+# Set by shutdown(); distinguishes deliberate cancellation from watchdog kills.
+_shutting_down = False
+
+# Finished agents are kept in memory this long for list_agents, then reaped
+# (full history lives in the agents DB table).
+_AGENT_RETENTION_SECONDS = 3600
+
+
+def _config_int(config: Any, key: str, default: int) -> int:
+    """Read an int from config, falling back on missing/malformed values."""
+    try:
+        return int(config.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
 @dataclass
 class DialogueChannel:
     agent_id: str
@@ -266,14 +284,17 @@ AGENT_TYPES: dict[str, dict[str, Any]] = {
             "If the task is ambiguous or you need clarification, return status \"needs_info\" with your question."
             + _JSON_SCHEMA_INSTRUCTION
         ),
+        # Least privilege: researchers consume untrusted web content, so they
+        # get no shell/files access (prompt-injection → shell is the realistic
+        # attack chain for a web-facing agent).
         "tools": [
-            "tavily_search", "web_scrape", "shell", "files",
+            "tavily_search", "web_scrape",
             "browser_navigate", "browser_click", "browser_type",
             "browser_screenshot", "browser_get_text", "browser_eval_js",
             "browser_get_elements", "browser_wait", "browser_select",
             "browser_scroll", "browser_back",
         ],
-        "tool_limits": {"web_search": 10, "tavily_search": 10, "shell": 10, "browser_navigate": 10},
+        "tool_limits": {"web_search": 10, "tavily_search": 10, "browser_navigate": 10},
     },
     "coder": {
         "system_suffix": (
@@ -305,28 +326,115 @@ AGENT_TYPES: dict[str, dict[str, Any]] = {
             "If a page requires login or hits a CAPTCHA, return status \"needs_info\"."
             + _JSON_SCHEMA_INSTRUCTION
         ),
+        # Least privilege: browser agents consume untrusted web content — no
+        # shell/files access (see researcher note above).
         "tools": [
             "browser_navigate", "browser_click", "browser_type",
             "browser_screenshot", "browser_get_text", "browser_eval_js",
             "browser_get_elements", "browser_wait", "browser_select",
             "browser_scroll", "browser_back",
-            "files", "shell",
         ],
-        "tool_limits": {"browser_navigate": 15, "browser_click": 30, "browser_type": 20, "shell": 10},
+        "tool_limits": {"browser_navigate": 15, "browser_click": 30, "browser_type": 20},
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Durable state (best-effort — never lets persistence break the agent flow)
+# ---------------------------------------------------------------------------
+
+async def _persist_agent(agent_id: str) -> None:
+    """Upsert the agent's current state into the agents table."""
+    info = _agents.get(agent_id)
+    if info is None:
+        return
+    try:
+        from spare_paw.db import get_db, is_initialized
+        if not is_initialized():
+            return
+        db = await get_db()
+        usage = info.get("usage")
+        await db.execute(
+            """
+            INSERT INTO agents
+                (id, name, group_id, agent_type, status, prompt, result,
+                 error, usage, created_at, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                result = excluded.result,
+                error = excluded.error,
+                usage = excluded.usage,
+                finished_at = excluded.finished_at
+            """,
+            (
+                agent_id,
+                info.get("name"),
+                info.get("group_id"),
+                info.get("agent_type"),
+                info.get("status", "unknown"),
+                info.get("prompt"),
+                info.get("result"),
+                info.get("error"),
+                json.dumps(usage) if usage else None,
+                info.get("created_at"),
+                info.get("finished_at"),
+            ),
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("Failed to persist agent %s", agent_id[:8])
+
+
+async def _persist_callback(group_id: str, payload: str) -> int | None:
+    """Write a pending callback row; returns its id (or None on failure)."""
+    try:
+        from spare_paw.db import get_db, is_initialized
+        if not is_initialized():
+            return None
+        db = await get_db()
+        cur = await db.execute(
+            "INSERT INTO agent_callbacks (group_id, payload, delivered, created_at) "
+            "VALUES (?, ?, 0, ?)",
+            (group_id, payload, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+        return cur.lastrowid
+    except Exception:
+        logger.exception("Failed to persist callback for group %s", group_id)
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Group completion check
 # ---------------------------------------------------------------------------
 
+_TERMINAL_STATUSES = ("completed", "failed", "timed_out", "interrupted")
+
+
 def _check_group_complete(group_id: str) -> bool:
     """Return True if all agents in the group have finished (completed or failed)."""
     group = [a for a in _agents.values() if a.get("group_id") == group_id]
     if not group:
         return False
-    return all(a["status"] in ("completed", "failed", "timed_out") for a in group)
+    return all(a["status"] in _TERMINAL_STATUSES for a in group)
+
+
+async def _maybe_notify_group(group_id: str) -> None:
+    """Notify the main agent once per group, no matter how many finishers race.
+
+    The claim is taken synchronously (no await between check and add), so two
+    agents finishing in the same event-loop tick cannot both pass it.
+    """
+    if not _check_group_complete(group_id):
+        return
+    if group_id in _notified_groups:
+        return
+    _notified_groups.add(group_id)
+    try:
+        await _notify_main_agent(group_id)
+    except Exception:
+        logger.exception("Failed to notify main agent for group %s", group_id)
 
 
 async def _notify_main_agent(group_id: str) -> None:
@@ -392,9 +500,21 @@ async def _notify_main_agent(group_id: str) -> None:
                 if msg_id is not None:
                     await backend.delete_progress(msg_id)
 
+    # Persist first: if the process dies (or the queue is gone) before the
+    # callback is processed, startup recovery re-enqueues undelivered rows.
+    callback_id = await _persist_callback(group_id, synthetic_text)
+
     if _message_queue is not None:
-        await _message_queue.put(("agent_callback", synthetic_text))
+        if callback_id is not None:
+            await _message_queue.put(("agent_callback", synthetic_text, callback_id))
+        else:
+            await _message_queue.put(("agent_callback", synthetic_text))
         logger.info("Group %s: pushed callback with %d agent results", group_id, len(group))
+    elif callback_id is not None:
+        logger.warning(
+            "Group %s completed with no message queue — callback %d persisted "
+            "for recovery on next startup", group_id, callback_id,
+        )
     else:
         logger.error("Group %s completed but no message queue — results DROPPED", group_id)
 
@@ -406,20 +526,24 @@ def _on_agent_done(agent_id: str, task: asyncio.Task) -> None:
     exc = task.exception()
     if exc is None:
         return  # Normal completion — _run_agent already updated status
+    info = _agents.get(agent_id)
+    if info is None:
+        logger.error("Agent %s crashed after eviction: %s", agent_id[:8], exc)
+        return
     error_msg = f"{type(exc).__name__}: {exc}"
-    _agents[agent_id]["status"] = "failed"
-    _agents[agent_id]["error"] = error_msg
-    _agents[agent_id].setdefault(
-        "finished_at", datetime.now(timezone.utc).isoformat()
-    )
+    info["status"] = "failed"
+    info["error"] = error_msg
+    info.setdefault("finished_at", datetime.now(timezone.utc).isoformat())
     logger.error("Agent %s crashed (done-callback): %s", agent_id[:8], error_msg)
 
     _cleanup_channel(agent_id)
 
-    group_id = _agents[agent_id].get("group_id")
-    if group_id and _check_group_complete(group_id):
+    asyncio.create_task(_persist_agent(agent_id), name=f"agent-persist-{agent_id}")
+
+    group_id = info.get("group_id")
+    if group_id:
         asyncio.create_task(
-            _notify_main_agent(group_id),
+            _maybe_notify_group(group_id),
             name=f"agent-notify-{group_id}",
         )
 
@@ -429,10 +553,30 @@ def _on_agent_done(agent_id: str, task: asyncio.Task) -> None:
 # ---------------------------------------------------------------------------
 
 async def _watchdog_tick() -> None:
-    """Single pass: cancel any stuck agents."""
+    """Single pass: cancel any stuck agents, reap old finished ones."""
     now = datetime.now(timezone.utc)
     for agent_id, info in list(_agents.items()):
-        if info["status"] != "running":
+        status = info["status"]
+
+        # Reap finished agents after the retention window — their full record
+        # is in the agents DB table; keeping them in memory forever leaks.
+        if status in _TERMINAL_STATUSES:
+            finished_at = info.get("finished_at")
+            if finished_at:
+                try:
+                    finished = datetime.fromisoformat(finished_at)
+                except ValueError:
+                    continue
+                if (now - finished).total_seconds() > _AGENT_RETENTION_SECONDS:
+                    group_id = info.get("group_id")
+                    _agents.pop(agent_id, None)
+                    if group_id and not any(
+                        a.get("group_id") == group_id for a in _agents.values()
+                    ):
+                        _notified_groups.discard(group_id)
+            continue
+
+        if status != "running":
             continue
         last = info.get("last_activity")
         if last is None:
@@ -465,6 +609,35 @@ def start_watchdog() -> None:
         _watchdog_task = asyncio.create_task(_watchdog_loop(), name="agent-watchdog")
 
 
+async def shutdown(timeout: float = 5.0) -> None:
+    """Orderly teardown: stop the watchdog, cancel running agents, wait briefly.
+
+    Cancelled agents record status "interrupted" (persisted via _run_agent's
+    finally block) so startup recovery can tell the user what was lost.
+    """
+    global _shutting_down
+    _shutting_down = True
+
+    if _watchdog_task is not None and not _watchdog_task.done():
+        _watchdog_task.cancel()
+
+    tasks = [
+        info["task"]
+        for info in _agents.values()
+        if info.get("task") is not None and not info["task"].done()
+    ]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            logger.warning(
+                "%d agent task(s) did not finish within %.0fs of shutdown",
+                len(pending), timeout,
+            )
+    logger.info("Subagent shutdown complete (%d agents cancelled)", len(tasks))
+
+
 # ---------------------------------------------------------------------------
 # Agent execution
 # ---------------------------------------------------------------------------
@@ -485,7 +658,7 @@ async def _run_agent(
 
     try:
         from spare_paw.core.prompt import build_subagent_prompt
-        from spare_paw.router.tool_loop import run_tool_loop
+        from spare_paw.router.tool_loop import coerce_loop_result, run_tool_loop
 
         # Build lightweight system prompt for subagent
         system_prompt = await build_subagent_prompt(suffix=system_suffix)
@@ -552,8 +725,11 @@ async def _run_agent(
         def _heartbeat(event: Any) -> None:
             _agents[agent_id]["last_activity"] = datetime.now(timezone.utc)
 
-        # Run tool loop with usage tracking
-        result_text, usage = await run_tool_loop(
+        # Hard cost ceiling for the whole agent run
+        token_budget = _config_int(app_state.config, "agent.subagent_token_budget", 150000)
+
+        # Run tool loop with structured outcome + usage tracking
+        loop_result = coerce_loop_result(await run_tool_loop(
             client=app_state.router_client,
             messages=messages,
             model=resolved_model,
@@ -561,23 +737,39 @@ async def _run_agent(
             tool_registry=agent_registry,
             max_iterations=max_iterations,
             executor=app_state.executor,
-            track_usage=True,
+            return_result=True,
+            token_budget=token_budget,
             tool_limits=tool_limits,
             on_event=_heartbeat,
-        )
-
-        parsed = parse_agent_result(result_text)
-        _agents[agent_id]["status"] = "completed"
+        ))
+        result_text = loop_result.text
         _agents[agent_id]["result"] = result_text
-        _agents[agent_id]["parsed_result"] = parsed
-        _agents[agent_id]["result_preview"] = parsed["summary"]
-        _agents[agent_id]["usage"] = usage
-        logger.info("Agent %s completed (agent_status=%s)", agent_id[:8], parsed["status"])
+        _agents[agent_id]["usage"] = loop_result.usage
+
+        if not loop_result.ok:
+            # Loop-level failure (timeout, budget, iteration cap) — never
+            # report it as a completed agent with the error text as findings.
+            _agents[agent_id]["status"] = "failed"
+            _agents[agent_id]["error"] = f"{loop_result.outcome}: {result_text[:200]}"
+            logger.warning(
+                "Agent %s failed (loop outcome=%s)", agent_id[:8], loop_result.outcome,
+            )
+        else:
+            parsed = parse_agent_result(result_text)
+            _agents[agent_id]["status"] = "completed"
+            _agents[agent_id]["parsed_result"] = parsed
+            _agents[agent_id]["result_preview"] = parsed["summary"]
+            logger.info("Agent %s completed (agent_status=%s)", agent_id[:8], parsed["status"])
 
     except asyncio.CancelledError:
-        _agents[agent_id]["status"] = "timed_out"
-        _agents[agent_id]["error"] = "Agent timed out: no activity for too long"
-        logger.warning("Agent %s timed out (cancelled by watchdog)", agent_id[:8])
+        if _shutting_down:
+            _agents[agent_id]["status"] = "interrupted"
+            _agents[agent_id]["error"] = "Interrupted by shutdown/restart"
+            logger.info("Agent %s interrupted by shutdown", agent_id[:8])
+        else:
+            _agents[agent_id]["status"] = "timed_out"
+            _agents[agent_id]["error"] = "Agent timed out: no activity for too long"
+            logger.warning("Agent %s timed out (cancelled by watchdog)", agent_id[:8])
 
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
@@ -598,7 +790,7 @@ async def _run_agent(
                 group_id = _agents[agent_id].get("group_id")
                 if group_id:
                     group = [a for a in _agents.values() if a.get("group_id") == group_id]
-                    done = sum(1 for a in group if a["status"] in ("completed", "failed", "timed_out"))
+                    done = sum(1 for a in group if a["status"] in _TERMINAL_STATUSES)
                     total = len(group)
                     status_emoji = "\u2705" if _agents[agent_id]["status"] == "completed" else "\u274c"
                     try:
@@ -609,13 +801,12 @@ async def _run_agent(
                     except Exception:
                         pass
 
-        # Check if the group is complete and notify
+        # Persist the terminal state, then check if the group is complete
+        await _persist_agent(agent_id)
+
         group_id = _agents[agent_id].get("group_id")
-        if group_id and _check_group_complete(group_id):
-            try:
-                await _notify_main_agent(group_id)
-            except Exception:
-                logger.exception("Failed to notify main agent for group %s", group_id)
+        if group_id:
+            await _maybe_notify_group(group_id)
 
 
 async def _handle_spawn(
@@ -645,6 +836,10 @@ async def _handle_spawn(
                 "status": "group_full",
                 "message": f"Max {_MAX_PER_GROUP} agents per group. Do NOT spawn more — reply to the user now.",
             })
+
+    # Clamp iterations server-side regardless of what the model asked for
+    cap = _config_int(app_state.config, "agent.subagent_max_iterations_cap", 30)
+    max_iterations = max(1, min(max_iterations, cap))
 
     # Resolve agent type
     tools_filter = tools
@@ -697,11 +892,18 @@ async def _handle_spawn(
     _agents[agent_id]["task"] = task
     task.add_done_callback(lambda t, aid=agent_id: _on_agent_done(aid, t))
 
-    # Send ephemeral progress message (Telegram-specific)
+    await _persist_agent(agent_id)
+
+    # Send ephemeral progress message (Telegram-specific). A delivery failure
+    # must not fail the spawn \u2014 the agent task is already running, and a tool
+    # error here would prompt the model to spawn a duplicate.
     backend = getattr(app_state, "backend", None)
     if backend is not None and hasattr(type(backend), "send_progress"):
-        msg_id = await backend.send_progress(f"\u23f3 Working on: {name}...")
-        _agents[agent_id]["progress_message_id"] = msg_id
+        try:
+            msg_id = await backend.send_progress(f"\u23f3 Working on: {name}...")
+            _agents[agent_id]["progress_message_id"] = msg_id
+        except Exception:
+            logger.exception("Failed to send progress message for agent %s", agent_id)
 
     logger.info("Spawned agent %s: %s (group=%s)", agent_id, name, resolved_group_id)
     return json.dumps({

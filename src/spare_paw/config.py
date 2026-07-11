@@ -40,8 +40,19 @@ def _build_defaults() -> dict[str, Any]:
             "token_budget": 120000,
             "safety_margin": 0.85,
         },
+        "llm": {
+            # Concurrent LLM calls (main agent + subagents + consults). 1
+            # serializes everything and starves consults; keep it small but >1.
+            "max_concurrent": 4,
+        },
         "agent": {
             "max_tool_iterations": 20,
+            # Hard server-side caps for spawned subagents, regardless of what
+            # the model asks for.
+            "subagent_max_iterations_cap": 30,
+            "subagent_token_budget": 150000,
+            # Wall-clock ceiling for processing one queued message end-to-end.
+            "message_timeout_seconds": 600,
             "system_prompt": (
                 "You are a personal AI assistant running 24/7.\n"
                 "You have access to the local filesystem, shell, web search, and web scraping.\n"

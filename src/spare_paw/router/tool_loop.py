@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ async def _stream_and_assemble(
     model: str,
     tools: list[dict[str, Any]] | None,
     on_token: Callable[[str], None] | None,
+    semaphore_held: bool = False,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     """Consume a streaming chat completion and return (assistant_message, usage).
 
@@ -35,7 +37,11 @@ async def _stream_and_assemble(
     tool_calls_by_index: dict[int, dict[str, Any]] = {}
     usage: dict[str, int] = {}
 
-    async for chunk in client.chat_stream(messages, model, tools):
+    stream_kwargs: dict[str, Any] = {}
+    if semaphore_held:
+        stream_kwargs["semaphore_held"] = True
+
+    async for chunk in client.chat_stream(messages, model, tools, **stream_kwargs):
         if chunk.kind == "text_delta" and chunk.content:
             text_parts.append(chunk.content)
             if on_token is not None:
@@ -76,6 +82,48 @@ class ToolEvent:
     result_preview: str | None = None
     iteration: int = 0
 
+
+# Loop outcomes. Anything other than OUTCOME_OK means ``text`` is a diagnostic
+# message, not a model reply — callers must not present it as a normal answer.
+OUTCOME_OK = "ok"
+OUTCOME_LLM_TIMEOUT = "llm_timeout"
+OUTCOME_BUDGET_EXHAUSTED = "budget_exhausted"
+OUTCOME_MAX_ITERATIONS = "max_iterations"
+
+
+@dataclass
+class ToolLoopResult:
+    """Structured result of a tool loop run: final text plus how it ended."""
+
+    text: str
+    outcome: str = OUTCOME_OK
+    usage: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome == OUTCOME_OK
+
+
+def coerce_loop_result(value: Any) -> ToolLoopResult:
+    """Normalize any historical run_tool_loop return shape into a ToolLoopResult.
+
+    Accepts a ToolLoopResult (passed through), a ``(text, usage)`` tuple
+    (track_usage mode), or a bare string — the latter two are assumed OK.
+    """
+    if isinstance(value, ToolLoopResult):
+        return value
+    if isinstance(value, tuple) and len(value) == 2:
+        return ToolLoopResult(text=value[0], usage=dict(value[1] or {}))
+    return ToolLoopResult(text=value if isinstance(value, str) else str(value))
+
+
+# Per-tool overrides of the generic tool timeout. consult_main needs a full
+# main-agent LLM round-trip (semaphore wait + retries), so the generic
+# tool_timeout would kill it structurally under load.
+TOOL_TIMEOUT_OVERRIDES: dict[str, float] = {
+    "consult_main": 180.0,
+}
+
 # Per-turn (not per-session) call limits. Tools not listed are unlimited.
 DEFAULT_TOOL_LIMITS: dict[str, int] = {
     "web_scrape": 5,
@@ -106,7 +154,8 @@ async def run_tool_loop(
     tool_timeout: float = 60.0,
     llm_timeout: float = 120.0,
     token_budget: int = 0,
-) -> str | tuple[str, dict[str, int]]:
+    return_result: bool = False,
+) -> str | tuple[str, dict[str, int]] | ToolLoopResult:
     """Run the model in a tool-calling loop until it produces a final text response.
 
     Each iteration:
@@ -137,12 +186,17 @@ async def run_tool_loop(
             (default 120s). Prevents stuck API calls.
         token_budget: Maximum cumulative tokens for the entire loop. 0 means
             no limit. When exceeded, the loop aborts with a message.
+        return_result: If True, return a :class:`ToolLoopResult` carrying the
+            text, the accumulated usage, and an ``outcome`` marker that
+            distinguishes real replies from loop-level failures. Takes
+            precedence over ``track_usage``.
 
     Returns:
         The final text content from the model when ``track_usage`` is False.
         A tuple of ``(text, usage_dict)`` when ``track_usage`` is True, where
         *usage_dict* has keys ``prompt_tokens``, ``completion_tokens``, and
-        ``total_tokens``.
+        ``total_tokens``. A :class:`ToolLoopResult` when ``return_result``
+        is True.
     """
     merged = {**DEFAULT_TOOL_LIMITS, **(tool_limits or {})}
     effective_limits: dict[str, int] = {
@@ -161,10 +215,17 @@ async def run_tool_loop(
         for key in total_usage:
             total_usage[key] += usage.get(key, 0)
 
-    def _maybe_with_usage(text: str) -> str | tuple[str, dict[str, int]]:
+    def _finish(text: str, outcome: str) -> str | tuple[str, dict[str, int]] | ToolLoopResult:
+        if return_result:
+            return ToolLoopResult(text=text, outcome=outcome, usage=total_usage)
         if track_usage:
             return (text, total_usage)
         return text
+
+    # The client's semaphore serializes LLM calls; acquire it OUTSIDE the
+    # llm_timeout window so queueing behind other calls doesn't masquerade
+    # as an API timeout. Fake clients in tests have no semaphore attribute.
+    llm_semaphore = getattr(client, "semaphore", None)
 
     for iteration in range(1, max_iterations + 1):
         # Token budget circuit breaker
@@ -175,9 +236,10 @@ async def run_tool_loop(
                 token_budget,
                 iteration,
             )
-            return _maybe_with_usage(
+            return _finish(
                 f"Stopped: token budget exceeded ({total_usage['total_tokens']:,}/{token_budget:,} tokens). "
-                "Try a simpler approach or break the task into smaller steps."
+                "Try a simpler approach or break the task into smaller steps.",
+                OUTCOME_BUDGET_EXHAUSTED,
             )
 
         if on_event is not None:
@@ -185,17 +247,22 @@ async def run_tool_loop(
 
         # Stream the model response, assembling text + tool_calls from deltas
         try:
-            assistant_message, usage = await asyncio.wait_for(
-                _stream_and_assemble(client, messages, model, tools, on_token),
-                timeout=llm_timeout,
-            )
+            async with llm_semaphore or contextlib.nullcontext():
+                assistant_message, usage = await asyncio.wait_for(
+                    _stream_and_assemble(
+                        client, messages, model, tools, on_token,
+                        semaphore_held=llm_semaphore is not None,
+                    ),
+                    timeout=llm_timeout,
+                )
         except asyncio.TimeoutError:
             logger.error(
                 "Iteration %d: LLM stream timed out after %.0fs",
                 iteration, llm_timeout,
             )
-            return _maybe_with_usage(
-                f"LLM call timed out after {llm_timeout:.0f}s. Try again."
+            return _finish(
+                f"LLM call timed out after {llm_timeout:.0f}s. Try again.",
+                OUTCOME_LLM_TIMEOUT,
             )
 
         # Accumulate usage from this iteration
@@ -219,7 +286,7 @@ async def run_tool_loop(
         if not tool_calls:
             # No tool calls — streaming already emitted tokens; return the final text.
             content = assistant_message.get("content") or ""
-            return _maybe_with_usage(content)
+            return _finish(content, OUTCOME_OK)
 
         # Append the assistant message (with tool_calls) to the conversation
         messages.append(assistant_message)
@@ -288,11 +355,12 @@ async def run_tool_loop(
                 ))
 
             # Execute the tool with timeout, catching any exception
+            effective_timeout = TOOL_TIMEOUT_OVERRIDES.get(name, tool_timeout)
             t0 = time.monotonic()
             try:
                 result = await asyncio.wait_for(
                     tool_registry.execute(name, args, executor),
-                    timeout=tool_timeout,
+                    timeout=effective_timeout,
                 )
                 result_str = str(result) if not isinstance(result, str) else result
                 duration_ms = (time.monotonic() - t0) * 1000
@@ -303,7 +371,7 @@ async def run_tool_loop(
                 )
             except asyncio.TimeoutError:
                 duration_ms = (time.monotonic() - t0) * 1000
-                result_str = f"Error: tool {name} timed out after {tool_timeout:.0f}s"
+                result_str = f"Error: tool {name} timed out after {effective_timeout:.0f}s"
                 logger.error(
                     "Iteration %d: tool %s timed out after %.0fms",
                     iteration, name, duration_ms,
@@ -348,7 +416,7 @@ async def run_tool_loop(
         # After all tool calls in this batch, honour the deferred stop
         if stop_reply is not None:
             logger.info("Executing deferred turn stop")
-            return _maybe_with_usage(stop_reply)
+            return _finish(stop_reply, OUTCOME_OK)
 
     # Exhausted max_iterations — make one final call without tools to get a
     # text summary from the model, or return a fallback error.
@@ -363,11 +431,13 @@ async def run_tool_loop(
         if choices:
             content = choices[0]["message"].get("content", "")
             if content:
-                return _maybe_with_usage(content)
+                # The forced summary is a legitimate model reply.
+                return _finish(content, OUTCOME_OK)
     except Exception as exc:
         logger.error("Final call after max iterations failed: %s", exc)
 
-    return _maybe_with_usage(
+    return _finish(
         f"Reached the maximum of {max_iterations} tool iterations "
-        "without a final response."
+        "without a final response.",
+        OUTCOME_MAX_ITERATIONS,
     )

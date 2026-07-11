@@ -21,7 +21,7 @@ from spare_paw.core.prompt import build_system_prompt
 from spare_paw.core.vision import describe_media
 from spare_paw.core.voice import VoiceTranscriptionError
 from spare_paw.core.voice_out import VoiceRenderError, render_voice_note
-from spare_paw.router.tool_loop import run_tool_loop
+from spare_paw.router.tool_loop import coerce_loop_result, run_tool_loop
 
 if TYPE_CHECKING:
     from spare_paw.backend import IncomingMessage, MessageBackend
@@ -84,6 +84,13 @@ async def process_message(
             text = await voice_module.transcribe(msg.voice_bytes, config_data)
         except VoiceTranscriptionError:
             logger.exception("Voice transcription failed")
+            try:
+                await backend.send_text(
+                    "⚠️ I couldn't transcribe that voice note — mind typing it "
+                    "or sending it again?"
+                )
+            except Exception:
+                logger.exception("Failed to send transcription-failure notice")
             return
 
     # 2. Vision preprocessing for images/videos
@@ -164,7 +171,7 @@ async def process_message(
     tool_schemas = app_state.tool_registry.get_schemas()
     max_iterations = app_state.config.get("agent.max_tool_iterations", 20)
 
-    response_text = await run_tool_loop(
+    loop_result = coerce_loop_result(await run_tool_loop(
         client=app_state.router_client,
         messages=messages,
         model=model,
@@ -172,9 +179,21 @@ async def process_message(
         tool_registry=app_state.tool_registry,
         max_iterations=max_iterations,
         executor=app_state.executor,
+        return_result=True,
         on_event=on_event,
         on_token=on_token,
-    )
+    ))
+    response_text = loop_result.text
+
+    if not loop_result.ok:
+        # Loop-level failure — tell the user honestly, but never record the
+        # diagnostic as an assistant reply in conversation history.
+        logger.error("Turn failed (outcome=%s): %s", loop_result.outcome, response_text)
+        try:
+            await backend.send_text(f"⚠️ I hit a problem with that: {response_text}")
+        except Exception:
+            logger.exception("Failed to send turn-failure notice")
+        return
 
     # 9. Ingest assistant response
     await ctx.ingest(conversation_id, "assistant", response_text)
@@ -262,10 +281,15 @@ async def process_agent_callback(
         messages = await ctx.assemble(conversation_id, system_prompt)
 
         model = resolve_model(app_state.config, "main_agent")
-        tool_schemas = app_state.tool_registry.get_schemas()
+        # The synthesis turn must not spawn more agents — completed agents
+        # triggering new spawns would allow unbounded agent chains.
+        tool_schemas = [
+            s for s in app_state.tool_registry.get_schemas()
+            if s.get("function", {}).get("name") != "spawn_agent"
+        ]
         max_iterations = app_state.config.get("agent.max_tool_iterations", 20)
 
-        response_text = await run_tool_loop(
+        loop_result = coerce_loop_result(await run_tool_loop(
             client=app_state.router_client,
             messages=messages,
             model=model,
@@ -273,7 +297,20 @@ async def process_agent_callback(
             tool_registry=app_state.tool_registry,
             max_iterations=max_iterations,
             executor=app_state.executor,
-        )
+            return_result=True,
+        ))
+        response_text = loop_result.text
+
+        if not loop_result.ok:
+            logger.error(
+                "Agent-callback synthesis failed (outcome=%s)", loop_result.outcome,
+            )
+            await backend.send_text(
+                "⚠️ Your background agents finished, but I hit a problem "
+                f"writing up the results: {response_text}\n"
+                "The raw results are saved — ask me to look them up."
+            )
+            return
 
         await ctx.ingest(conversation_id, "assistant", response_text)
         await backend.send_text(response_text)
@@ -302,6 +339,15 @@ async def enqueue(item: IncomingMessage | tuple) -> None:
         logger.error("enqueue() called but queue not initialized — item DROPPED: %s", type(item))
 
 
+def queue_healthy() -> bool:
+    """True while the queue consumer task is alive (or not started yet).
+
+    The gateway heartbeat gates the systemd watchdog ping on this, so a dead
+    consumer no longer looks like a healthy process.
+    """
+    return _queue_task is None or not _queue_task.done()
+
+
 def start_queue_processor(app_state: Any, backend: MessageBackend) -> None:
     """Start the background task that drains the message queue."""
     global _message_queue, _queue_task
@@ -316,32 +362,144 @@ def start_queue_processor(app_state: Any, backend: MessageBackend) -> None:
     logger.info("Message queue processor started")
 
 
-async def _process_queue(app_state: Any, backend: MessageBackend) -> None:
-    """Drain the message queue, processing one message at a time."""
+async def stop_queue_processor(drain_timeout: float = 8.0) -> None:
+    """Drain outstanding queue items (bounded), then cancel the consumer."""
+    global _queue_task
+    if _message_queue is not None:
+        try:
+            await asyncio.wait_for(_message_queue.join(), timeout=drain_timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Queue not drained after %.0fs — cancelling with %d item(s) pending",
+                drain_timeout, _message_queue.qsize(),
+            )
+    if _queue_task is not None and not _queue_task.done():
+        _queue_task.cancel()
+        try:
+            await _queue_task
+        except asyncio.CancelledError:
+            pass
+    logger.info("Message queue processor stopped")
+
+
+async def _mark_callback_delivered(callback_id: int) -> None:
+    """Flag a persisted agent callback as delivered (best-effort)."""
+    try:
+        from spare_paw.db import get_db, is_initialized
+        if not is_initialized():
+            return
+        db = await get_db()
+        await db.execute(
+            "UPDATE agent_callbacks SET delivered = 1 WHERE id = ?", (callback_id,)
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("Failed to mark callback %s delivered", callback_id)
+
+
+async def recover_orphans(app_state: Any, backend: MessageBackend) -> None:
+    """Startup reconciliation after a restart.
+
+    Marks agents that were running when the process died as interrupted (and
+    tells the user which ones), then re-enqueues any persisted callbacks that
+    were never processed.
+    """
+    try:
+        from spare_paw.db import get_db, is_initialized
+        if not is_initialized():
+            return
+        db = await get_db()
+
+        async with db.execute(
+            "SELECT id, name FROM agents WHERE status IN ('starting', 'running')"
+        ) as cur:
+            orphans = await cur.fetchall()
+        if orphans:
+            now = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+            await db.execute(
+                "UPDATE agents SET status = 'interrupted', "
+                "error = 'Interrupted by restart', finished_at = ? "
+                "WHERE status IN ('starting', 'running')",
+                (now,),
+            )
+            await db.commit()
+            names = ", ".join(row["name"] or row["id"] for row in orphans)
+            logger.warning("Recovered %d orphaned agent(s): %s", len(orphans), names)
+            try:
+                await backend.send_text(
+                    f"⚠️ A restart interrupted {len(orphans)} background "
+                    f"agent(s): {names}. Ask me again if you still need them."
+                )
+            except Exception:
+                logger.exception("Failed to send orphan-recovery notice")
+
+        async with db.execute(
+            "SELECT id, payload FROM agent_callbacks WHERE delivered = 0"
+        ) as cur:
+            pending = await cur.fetchall()
+        for row in pending:
+            logger.info("Re-enqueueing undelivered agent callback %d", row["id"])
+            await enqueue(("agent_callback", row["payload"], row["id"]))
+    except Exception:
+        logger.exception("Orphan recovery failed")
+
+
+async def _handle_queue_item(
+    app_state: Any, item: Any, backend: MessageBackend
+) -> None:
+    """Process one queue item with a wall-clock ceiling and error reporting."""
     from spare_paw.backend import IncomingMessage as _IncomingMessage
 
+    try:
+        timeout_s = float(app_state.config.get("agent.message_timeout_seconds", 600) or 600)
+    except (TypeError, ValueError):
+        timeout_s = 600.0
+
+    try:
+        if isinstance(item, tuple) and len(item) >= 2 and item[0] == "agent_callback":
+            await asyncio.wait_for(
+                process_agent_callback(app_state, item[1], backend),
+                timeout=timeout_s,
+            )
+            if len(item) > 2 and item[2] is not None:
+                await _mark_callback_delivered(item[2])
+        elif isinstance(item, _IncomingMessage):
+            # Start typing indicator
+            await backend.send_typing()
+            await asyncio.wait_for(
+                process_message(app_state, item, backend),
+                timeout=timeout_s,
+            )
+        else:
+            logger.warning("Unknown item type in queue: %s", type(item))
+    except asyncio.TimeoutError:
+        logger.error("Queue item timed out after %.0fs: %s", timeout_s, type(item))
+        try:
+            await backend.send_text(
+                "⚠️ That took too long and I had to stop. Try again, or break "
+                "it into smaller steps."
+            )
+        except Exception:
+            logger.exception("Failed to send timeout notice")
+    except Exception:
+        logger.exception("Unhandled error processing queue item")
+        try:
+            await backend.send_text(
+                "An internal error occurred. Please try again."
+            )
+        except Exception:
+            logger.exception("Failed to send error reply")
+
+
+async def _process_queue(app_state: Any, backend: MessageBackend) -> None:
+    """Drain the message queue, processing one message at a time."""
     assert _message_queue is not None
 
     while True:
         try:
             item = await _message_queue.get()
             try:
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "agent_callback":
-                    await process_agent_callback(app_state, item[1], backend)
-                elif isinstance(item, _IncomingMessage):
-                    # Start typing indicator
-                    await backend.send_typing()
-                    await process_message(app_state, item, backend)
-                else:
-                    logger.warning("Unknown item type in queue: %s", type(item))
-            except Exception:
-                logger.exception("Unhandled error processing queue item")
-                try:
-                    await backend.send_text(
-                        "An internal error occurred. Please try again."
-                    )
-                except Exception:
-                    logger.exception("Failed to send error reply")
+                await _handle_queue_item(app_state, item, backend)
             finally:
                 _message_queue.task_done()
         except asyncio.CancelledError:

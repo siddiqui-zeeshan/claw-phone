@@ -16,3 +16,4 @@ feat/
 *.log
 logs/
 IDENTITY_vareesha.md
+.claude/
