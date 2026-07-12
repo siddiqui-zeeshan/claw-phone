@@ -23,7 +23,7 @@ spare-paw = "spare_paw.__main__:main"
 
 [project.optional-dependencies]
 tui = ["rich>=13.0", "textual>=1.0"]
-dev = ["pytest", "pytest-asyncio", "rich>=13.0"]
+dev = ["pytest", "pytest-asyncio", "pytest-timeout", "rich>=13.0", "textual>=1.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
