@@ -583,3 +583,199 @@ class TestVisionPreprocessing:
 
         for m in assembled:
             assert isinstance(m["content"], str), f"Found multimodal content block: {m}"
+
+
+# ---------------------------------------------------------------------------
+# Robustness audit fixes
+# ---------------------------------------------------------------------------
+
+import pytest_asyncio  # noqa: E402
+from unittest.mock import patch as _patch  # noqa: E402,F401
+
+from spare_paw.core import engine as engine_mod  # noqa: E402
+from spare_paw.core.voice import VoiceTranscriptionError  # noqa: E402
+from spare_paw.router.tool_loop import ToolLoopResult  # noqa: E402
+
+
+def _patch_ctx(mock_ctx):
+    mock_ctx.get_or_create_conversation = AsyncMock(return_value="conv-1")
+    mock_ctx.ingest = AsyncMock(return_value="msg-1")
+    mock_ctx.assemble = AsyncMock(return_value=[{"role": "system", "content": "s"}])
+    mock_ctx.get_conversation_meta = AsyncMock(return_value={})
+    mock_ctx.set_conversation_meta = AsyncMock()
+
+
+class TestVoiceFailureNotice:
+    @pytest.mark.asyncio
+    async def test_transcription_failure_notifies_user(self):
+        """A failed transcription must not be a silent drop."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(voice_bytes=b"\x00\x01")
+
+        with patch("spare_paw.core.engine.voice_module") as mock_voice, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock) as mock_loop:
+            mock_voice.transcribe = AsyncMock(side_effect=VoiceTranscriptionError("bad audio"))
+            await process_message(app_state, msg, backend)
+
+        backend.send_text.assert_awaited()
+        notice = backend.send_text.await_args.args[0]
+        assert "transcribe" in notice.lower() or "voice" in notice.lower()
+        mock_loop.assert_not_awaited()
+
+
+class TestFailedOutcomeHandling:
+    @pytest.mark.asyncio
+    async def test_failed_outcome_not_ingested_as_assistant(self):
+        """Loop failures must not be recorded as assistant replies in history."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        msg = IncomingMessage(text="hello")
+
+        failed = ToolLoopResult(
+            text="LLM call timed out after 120s. Try again.",
+            outcome="llm_timeout",
+            usage={},
+        )
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value=failed), \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"), \
+             patch("spare_paw.core.engine.compact_with_retry", new_callable=AsyncMock):
+            _patch_ctx(mock_ctx)
+            await process_message(app_state, msg, backend)
+
+        ingested_roles = [c.args[1] for c in mock_ctx.ingest.await_args_list]
+        assert "assistant" not in ingested_roles
+        backend.send_text.assert_awaited()
+        sent = backend.send_text.await_args.args[0]
+        assert "timed out" in sent
+
+
+class TestSynthesisCannotSpawn:
+    @pytest.mark.asyncio
+    async def test_agent_callback_synthesis_excludes_spawn_agent(self):
+        """Callback synthesis must not be able to spawn more agents (unbounded chains)."""
+        app_state = _make_app_state()
+        backend = _make_backend()
+        app_state.tool_registry.get_schemas.return_value = [
+            {"type": "function", "function": {"name": "spawn_agent"}},
+            {"type": "function", "function": {"name": "shell"}},
+        ]
+
+        with patch("spare_paw.core.engine.ctx_module") as mock_ctx, \
+             patch("spare_paw.core.engine.run_tool_loop", new_callable=AsyncMock, return_value="synth") as mock_loop, \
+             patch("spare_paw.core.engine.build_system_prompt", new_callable=AsyncMock, return_value="sys"):
+            _patch_ctx(mock_ctx)
+            await process_agent_callback(app_state, "[AGENT_RESULTS] done", backend)
+
+        tools = mock_loop.await_args.kwargs["tools"]
+        names = {t["function"]["name"] for t in tools}
+        assert "spawn_agent" not in names
+        assert "shell" in names
+
+
+class TestQueueItemHandling:
+    @pytest.mark.asyncio
+    async def test_message_timeout_notifies_user(self):
+        """A single stuck message must not silently block the queue forever."""
+        app_state = _make_app_state()
+        app_state.config.get = lambda key, default=None: {
+            "agent.message_timeout_seconds": 0.05,
+        }.get(key, default)
+        backend = _make_backend()
+        msg = IncomingMessage(text="slow")
+
+        async def hang(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        with patch("spare_paw.core.engine.process_message", side_effect=hang):
+            await engine_mod._handle_queue_item(app_state, msg, backend)
+
+        backend.send_text.assert_awaited()
+        sent = backend.send_text.await_args.args[0]
+        assert "long" in sent.lower() or "timed out" in sent.lower()
+
+    def test_queue_healthy_reports_dead_task(self):
+        class _DoneTask:
+            def done(self):
+                return True
+
+        old = engine_mod._queue_task
+        try:
+            engine_mod._queue_task = None
+            assert engine_mod.queue_healthy() is True
+            engine_mod._queue_task = _DoneTask()
+            assert engine_mod.queue_healthy() is False
+        finally:
+            engine_mod._queue_task = old
+
+
+@pytest_asyncio.fixture
+async def _tmp_engine_db(tmp_path):
+    import spare_paw.db as db_mod
+
+    tmp_db_dir = tmp_path / ".spare-paw"
+    tmp_db_dir.mkdir()
+    with patch.object(db_mod, "DB_DIR", tmp_db_dir), \
+         patch.object(db_mod, "DB_PATH", tmp_db_dir / "spare-paw.db"):
+        db_mod._connection = None
+        await db_mod.init_db()
+        yield db_mod
+        await db_mod.close_db()
+
+
+class TestRecovery:
+    @pytest.mark.asyncio
+    async def test_recover_orphans_marks_interrupted_and_requeues(self, _tmp_engine_db):
+        db = await _tmp_engine_db.get_db()
+        await db.execute(
+            "INSERT INTO agents (id, name, status, created_at) VALUES (?, ?, ?, ?)",
+            ("orph1", "orphaned-agent", "running", "2026-01-01T00:00:00+00:00"),
+        )
+        await db.execute(
+            "INSERT INTO agent_callbacks (group_id, payload, delivered, created_at) "
+            "VALUES (?, ?, 0, ?)",
+            ("g1", "[AGENT_RESULTS] pending", "2026-01-01T00:00:00+00:00"),
+        )
+        await db.commit()
+
+        app_state = _make_app_state()
+        backend = _make_backend()
+        old_queue = engine_mod._message_queue
+        engine_mod._message_queue = asyncio.Queue()
+        try:
+            await engine_mod.recover_orphans(app_state, backend)
+
+            async with db.execute("SELECT status FROM agents WHERE id = 'orph1'") as cur:
+                row = await cur.fetchone()
+            assert row["status"] == "interrupted"
+
+            backend.send_text.assert_awaited()
+            notice = backend.send_text.await_args.args[0]
+            assert "orphaned-agent" in notice
+
+            item = engine_mod._message_queue.get_nowait()
+            assert item[0] == "agent_callback"
+            assert item[1] == "[AGENT_RESULTS] pending"
+        finally:
+            engine_mod._message_queue = old_queue
+
+    @pytest.mark.asyncio
+    async def test_mark_callback_delivered(self, _tmp_engine_db):
+        db = await _tmp_engine_db.get_db()
+        cur = await db.execute(
+            "INSERT INTO agent_callbacks (group_id, payload, delivered, created_at) "
+            "VALUES (?, ?, 0, ?)",
+            ("g2", "payload", "2026-01-01T00:00:00+00:00"),
+        )
+        await db.commit()
+        cb_id = cur.lastrowid
+
+        await engine_mod._mark_callback_delivered(cb_id)
+
+        async with db.execute(
+            "SELECT delivered FROM agent_callbacks WHERE id = ?", (cb_id,)
+        ) as cur2:
+            row = await cur2.fetchone()
+        assert row["delivered"] == 1

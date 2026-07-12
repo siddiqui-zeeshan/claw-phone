@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 DB_DIR = Path.home() / ".spare-paw"
 DB_PATH = DB_DIR / "spare-paw.db"
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 SCHEMA_V1 = """\
 CREATE TABLE IF NOT EXISTS messages (
@@ -137,9 +137,45 @@ CREATE TRIGGER IF NOT EXISTS summary_nodes_au AFTER UPDATE ON summary_nodes BEGI
 END;
 """
 
+SCHEMA_V4 = """\
+CREATE TABLE IF NOT EXISTS agents (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    group_id TEXT,
+    agent_type TEXT,
+    status TEXT NOT NULL,
+    prompt TEXT,
+    result TEXT,
+    error TEXT,
+    usage TEXT,
+    created_at TEXT,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_agents_group ON agents(group_id);
+CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+
+CREATE TABLE IF NOT EXISTS agent_callbacks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT,
+    payload TEXT NOT NULL,
+    delivered INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+"""
+
 # ---- Singleton connection ----
 
 _connection: aiosqlite.Connection | None = None
+
+
+def is_initialized() -> bool:
+    """True once the shared connection exists (init_db/get_db has run).
+
+    Best-effort persistence helpers use this to avoid implicitly creating
+    a database in contexts that never initialized one (e.g. unit tests).
+    """
+    return _connection is not None
 
 
 async def get_db() -> aiosqlite.Connection:
@@ -188,6 +224,13 @@ async def init_db() -> None:
         await _set_user_version(conn, 3)
         await conn.commit()
         logger.info("Database schema v3 applied")
+
+    if version < 4:
+        logger.info("Migrating database to schema v4 (agents, agent_callbacks)")
+        await conn.executescript(SCHEMA_V4)
+        await _set_user_version(conn, 4)
+        await conn.commit()
+        logger.info("Database schema v4 applied")
 
 
 async def close_db() -> None:

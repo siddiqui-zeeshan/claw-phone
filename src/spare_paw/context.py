@@ -34,7 +34,7 @@ _encoder: tiktoken.Encoding | None = None
 
 # Per-conversation compaction failure counter (resets on success)
 _compact_consecutive_failures: dict[str, int] = {}
-_COMPACT_FAILURE_WARN_THRESHOLD: int = 3
+_COMPACT_FAILURE_ESCALATION_THRESHOLD: int = 3
 _COMPACT_RETRY_DELAY_SECONDS: float = 2
 
 
@@ -135,7 +135,14 @@ async def assemble(
         }
         # Restore tool_call metadata if present
         if row["metadata"]:
-            meta = json.loads(row["metadata"])
+            try:
+                meta = json.loads(row["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Invalid JSON in messages.metadata for message %s — skipping metadata",
+                    row["id"],
+                )
+                meta = {}
             if "tool_call_id" in meta:
                 msg["tool_call_id"] = meta["tool_call_id"]
             if "tool_calls" in meta:
@@ -369,14 +376,20 @@ async def compact(
 
     # Find message IDs already covered by existing summary nodes
     async with db.execute(
-        "SELECT source_msg_ids FROM summary_nodes WHERE conversation_id = ? AND depth = 0",
+        "SELECT id, source_msg_ids FROM summary_nodes WHERE conversation_id = ? AND depth = 0",
         (conversation_id,),
     ) as cur:
         rows = await cur.fetchall()
 
     covered_ids: set[str] = set()
     for row in rows:
-        covered_ids.update(json.loads(row["source_msg_ids"]))
+        try:
+            covered_ids.update(json.loads(row["source_msg_ids"]))
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "Invalid JSON in summary_nodes.source_msg_ids for node %s — treating as empty",
+                row["id"],
+            )
 
     # Filter to uncovered messages only
     uncovered = [
@@ -408,7 +421,8 @@ async def compact_with_retry(
 
     - On first failure: logs WARNING, waits before retrying once.
     - On retry failure: logs ERROR, skips compaction for this cycle.
-    - Tracks consecutive failures per conversation; logs WARNING at >= 3.
+    - Tracks consecutive failures per conversation (module-level
+      _compact_consecutive_failures); escalates to a distinct ERROR at >= 3.
     - Resets the failure counter on success.
     - Source messages are never deleted on failure. Partial summary nodes
       may persist from a failed attempt; the next successful compaction
@@ -438,10 +452,11 @@ async def compact_with_retry(
             "skipping this cycle (consecutive failures: %d)",
             conversation_id, exc, count,
         )
-        if count >= _COMPACT_FAILURE_WARN_THRESHOLD:
-            logger.warning(
-                "LCM compaction has failed %d+ times consecutively for conversation %s",
-                _COMPACT_FAILURE_WARN_THRESHOLD, conversation_id,
+        if count >= _COMPACT_FAILURE_ESCALATION_THRESHOLD:
+            logger.error(
+                "LCM compaction has failed %d times consecutively for conversation %s — "
+                "compression is stalled and context will keep growing; needs attention",
+                count, conversation_id,
             )
 
 
@@ -540,21 +555,31 @@ async def _condense_summaries(
     leaf_ids = [leaf["id"] for leaf in leaves]
     source_ids = json.dumps(leaf_ids)
 
-    await db.execute(
-        """INSERT INTO summary_nodes
-           (id, conversation_id, parent_id, depth, content, token_count, source_msg_ids, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (node_id, conversation_id, None, 1, condensed_text, token_count, source_ids, now),
-    )
-
-    # Update leaf nodes to point to the new parent
-    for leaf_id in leaf_ids:
+    # The shared aiosqlite connection uses sqlite3's implicit-transaction mode
+    # (isolation_level=""), so without an explicit transaction a crash between
+    # the INSERT and the UPDATEs would leave a pending orphaned condensed node
+    # that the next unrelated commit on the connection would persist. Make the
+    # multi-step write explicitly atomic.
+    await db.execute("BEGIN IMMEDIATE")
+    try:
         await db.execute(
-            "UPDATE summary_nodes SET parent_id = ? WHERE id = ?",
-            (node_id, leaf_id),
+            """INSERT INTO summary_nodes
+               (id, conversation_id, parent_id, depth, content, token_count, source_msg_ids, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (node_id, conversation_id, None, 1, condensed_text, token_count, source_ids, now),
         )
 
-    await db.commit()
+        # Update leaf nodes to point to the new parent
+        for leaf_id in leaf_ids:
+            await db.execute(
+                "UPDATE summary_nodes SET parent_id = ? WHERE id = ?",
+                (node_id, leaf_id),
+            )
+
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
 
     logger.debug(
         "Condensed %d leaves into node %s (depth=1) for conversation %s",

@@ -6,10 +6,10 @@ A 24/7 personal AI agent accessible through Telegram. Runs on macOS, Linux, Wind
 
 - **Role-based model selection** -- 8 model roles (main_agent, coder, planner, cron, researcher, analyst, summary, vision) each independently configurable via OpenRouter; fallback chain: role-specific model -> main_agent -> google/gemini-2.0-flash
 - **Tool use** -- shell commands, file operations, web search, web scraping, browser automation, cron management; all exposed as LLM function calls
-- **Scheduled tasks (cron)** -- create, edit, pause, resume, and manage recurring AI tasks with per-cron model selection
+- **Scheduled tasks (cron)** -- create, edit, pause, resume, and manage recurring AI tasks with per-cron model selection; jobs missed while the bot is down run once on restart, one-shot reminders can never double-fire, and schedules can be pinned to an explicit timezone via `cron.timezone`
 - **One-shot reminders** -- ask the bot to remind you of something in X minutes/hours; it creates a cron that fires once and auto-deletes itself (e.g. "remind me to call John in 30 minutes")
 - **Photo/image and video support** -- send photos and videos via Telegram; images and videos are preprocessed through a vision-capable model (configurable via `models.vision`, defaults to `google/gemini-3.1-flash-lite-preview`) to generate text descriptions. The main agent receives text summaries instead of raw media, reducing token costs while preserving semantic content. Captions are used as the prompt (defaults to "What do you see in this image/video?")
-- **Voice messages** -- Groq Whisper transcription for Telegram voice notes
+- **Voice messages** -- Groq Whisper transcription for Telegram voice notes; if transcription fails you get a reply saying so instead of silence
 - **Prompt files** -- loads `IDENTITY.md`, `USER.md`, and `SYSTEM.md` from `~/.spare-paw/` on every turn for personality, user preferences, and device context. Editable live without restart
 - **Full-text search** -- FTS5-backed search across all conversation history
 - **DAG-based lossless context management (LCM)** -- when conversation history grows beyond the fresh tail (32 messages), older messages are automatically summarized into leaf nodes (~8 messages each); when 4+ leaves accumulate they condense into higher-level summaries. Every original message is preserved and searchable. Summaries are assembled between the system prompt and fresh messages so the LLM retains awareness of older context. Compaction uses a cheap configurable model (default `google/gemini-3.1-flash-lite`) to keep costs low
@@ -19,7 +19,9 @@ A 24/7 personal AI agent accessible through Telegram. Runs on macOS, Linux, Wind
 - **Message queue with backpressure** -- incoming messages queue while the bot is busy; typing indicator signals processing
 - **Heartbeat watchdog** -- detects event loop starvation and deadlocks, not just process crashes
 - **Deep thinking (`/plan`)** -- on-demand planning phase that decomposes complex requests into a structured execution plan before the tool loop runs. A single cheap LLM call (no tools) produces a step-by-step plan with tool/agent classification and parallelism hints; the plan is injected as context for the main model to follow. Regular messages skip planning entirely (zero overhead)
-- **Agent orchestration** -- spawn multiple subagents in a single turn; agents spawned in the same tool-call batch are deterministically grouped (via a shared batch group_id injected by the tool loop) and their results are delivered together as one synthesized response. Three predefined archetypes: `researcher` (web search + scraping), `coder` (shell + files), `analyst` (data analysis), each with preset tools and system prompt. Safety limits: max 3 concurrent agents, max 3 per group
+- **Agent orchestration** -- spawn multiple subagents in a single turn; agents spawned in the same tool-call batch are deterministically grouped (via a shared batch group_id injected by the tool loop) and their results are delivered together as one synthesized response. Agents run genuinely in parallel: LLM concurrency is configurable via `llm.max_concurrent` (default 4). Four predefined archetypes: `researcher` (web search + scraping + browser), `coder` (shell + files), `analyst` (data analysis), `browser` (web automation), each with preset tools and system prompt; `researcher` and `browser` run without shell or file access since they consume untrusted web content. Safety limits: max 3 concurrent agents, max 3 per group, plus a per-agent token budget and iteration cap (`agent.subagent_token_budget`, `agent.subagent_max_iterations_cap`)
+- **Restart-safe agents** -- agent state and results are persisted to SQLite; after a restart the bot tells you which agents were interrupted and delivers any results that hadn't been sent yet
+- **Honest failure reporting** -- LLM timeouts, token-budget stops, and iteration limits are reported to you as failures instead of being silently recorded or disguised as replies; a per-message processing timeout (`agent.message_timeout_seconds`, default 600s) notifies you rather than hanging forever
 - **Bidirectional agent dialogue** -- subagents can consult the main agent for clarification or decision-making via the `consult_main` tool. Supports up to 5 rounds of back-and-forth within a single spawn, enabling complex collaborative workflows where agents ask questions before proceeding with their work
 - **Token/cost tracking** -- per-agent token usage tracking (prompt, completion, total) from OpenRouter, visible via `list_agents`
 - **MCP client** -- connect to external MCP servers (GitHub, filesystem, etc.) and use their tools alongside native tools
@@ -124,7 +126,9 @@ A template is provided at `config.example.yaml`. Key sections:
 | `context` | `max_messages`, `token_budget`, `safety_margin`, `fresh_tail_count`, `leaf_chunk_size`, `condensed_min_fanout` |
 | `tools` | Per-tool enable/disable, timeouts, allowed paths |
 | `mcp` | MCP client server connections |
-| `agent` | `max_tool_iterations`, `system_prompt` template |
+| `llm` | `max_concurrent` — parallel LLM calls across main agent + subagents (default 4) |
+| `agent` | `max_tool_iterations`, `subagent_token_budget` (default 150000), `subagent_max_iterations_cap` (default 30), `message_timeout_seconds` (default 600), `system_prompt` template |
+| `cron` | `timezone` — explicit timezone for cron schedules (defaults to system local) |
 | `logging` | Log level, rotation size, backup count |
 
 Role-based model configuration:
@@ -401,6 +405,7 @@ MCP support requires `mcp>=1.26.0`, included in the package dependencies.
 - **Lazy launch** -- Chromium is started on the first `browser_*` call and reuses the same instance across tool calls within a conversation
 - **Navigate, interact, extract** -- `browser_navigate`, `browser_click`, `browser_type`, `browser_get_text`, `browser_get_elements`, `browser_eval_js`
 - **Visual feedback** -- `browser_screenshot` returns a page screenshot; `browser_wait` blocks until a selector appears
+- **Private screenshots** -- screenshots are stored in `~/.spare-paw/screenshots` (owner-only permissions) and auto-deleted after 7 days
 - **Requirement** -- `chromium-browser` (or equivalent) must be installed on the system (`pkg install chromium` on Termux, `brew install --cask chromium` on macOS)
 
 ## GitHub Integration
@@ -499,7 +504,7 @@ Core Engine (core/engine.py)
 Context Manager (SQLite + FTS5 + DAG-based lossless context management)
   |
   v
-Model Router (OpenRouter API, role-based selection, semaphore-serialized, retry with backoff)
+Model Router (OpenRouter API, role-based selection, bounded concurrency, retry with backoff)
   |
   v
 Tools (ProcessPoolExecutor: shell, files, web search, web scrape, browser, cron, vision)
@@ -516,13 +521,15 @@ The core engine is decoupled from any specific frontend via the `MessageBackend`
 Key design points:
 
 - Single async event loop with a ProcessPoolExecutor (4 workers) for blocking operations
-- `asyncio.Semaphore(1)` serializes all model API calls to prevent races
+- Model API calls run under a bounded semaphore (`llm.max_concurrent`, default 4), so parallel agents make genuinely parallel LLM calls
 - Heartbeat file touched every 30s; watchdog restarts if stale beyond 90s
 - Cron outputs are delivered to the active backend but do not enter conversation memory
 - Subagents don't message the user directly; results flow back through a group callback queue, letting the main LLM synthesize a unified response. Results are stored in conversation memory for follow-up questions
+- Agent state and results are persisted to SQLite (schema v4); on startup, agents orphaned by a restart are marked interrupted and reported to the user, and any undelivered results are re-enqueued
+- Telegram sends retry with exponential backoff on transient network errors before giving up
 - Multiple agents spawned in one tool-call batch are deterministically grouped by the tool loop (shared batch group_id); the turn stop is deferred until all spawns in the batch complete
 - Safety limits: max 3 concurrent agents, max 3 per group
-- Three agent archetypes (`researcher`, `coder`, `analyst`) each set appropriate tools and system prompt
+- Four agent archetypes (`researcher`, `coder`, `analyst`, `browser`) each set appropriate tools and system prompt; `researcher` and `browser` get no shell/file access (least privilege against prompt injection from web content)
 - Each agent tracks token usage (prompt, completion, total) from OpenRouter API responses
 - Token counting uses tiktoken with a configurable safety margin for non-OpenAI models
 - DAG compaction runs automatically after each turn: messages beyond the fresh tail are chunked into leaf summaries, and when enough leaves accumulate they condense into higher-level nodes. Schema v3 adds a `summary_nodes` table with FTS5 index. `assemble()` injects compressed history between the system prompt and fresh messages

@@ -61,6 +61,12 @@ class OpenRouterClient:
         self._models_cache: list[dict[str, Any]] | None = None
         self._models_cache_time: float = 0
 
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        """The shared LLM-call semaphore, for callers that need to acquire it
+        themselves (e.g. to exclude queueing time from their own timeouts)."""
+        return self._semaphore
+
     def _get_session(self) -> aiohttp.ClientSession:
         """Lazily create and return the aiohttp session."""
         if self._session is None or self._session.closed:
@@ -172,8 +178,14 @@ class OpenRouterClient:
         messages: list[dict[str, Any]],
         model: str,
         tools: list[dict[str, Any]] | None = None,
+        *,
+        semaphore_held: bool = False,
     ) -> AsyncIterator[StreamChunk]:
-        """Yield structured StreamChunk events via OpenRouter SSE."""
+        """Yield structured StreamChunk events via OpenRouter SSE.
+
+        Pass ``semaphore_held=True`` when the caller already holds
+        :attr:`semaphore` (avoids a deadlock-prone double acquire).
+        """
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -183,52 +195,62 @@ class OpenRouterClient:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
-        session = self._get_session()
+        if semaphore_held:
+            async for chunk in self._stream_request(body):
+                yield chunk
+            return
+
         async with self._semaphore:
-            async with session.post(OPENROUTER_URL, json=body) as resp:
-                if resp.status >= 400:
-                    text = await resp.text()
-                    raise OpenRouterError(resp.status, text)
+            async for chunk in self._stream_request(body):
+                yield chunk
 
-                async for line in resp.content:
-                    decoded = line.decode("utf-8").strip()
-                    if not decoded.startswith("data: "):
-                        continue
-                    payload = decoded[6:]
-                    if payload == "[DONE]":
-                        return
-                    try:
-                        chunk_data = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
+    async def _stream_request(self, body: dict[str, Any]) -> AsyncIterator[StreamChunk]:
+        """Execute one SSE streaming request and yield parsed chunks."""
+        session = self._get_session()
+        async with session.post(OPENROUTER_URL, json=body) as resp:
+            if resp.status >= 400:
+                text = await resp.text()
+                raise OpenRouterError(resp.status, text)
 
-                    choices = chunk_data.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    delta = choice.get("delta") or {}
-                    finish_reason = choice.get("finish_reason")
+            async for line in resp.content:
+                decoded = line.decode("utf-8").strip()
+                if not decoded.startswith("data: "):
+                    continue
+                payload = decoded[6:]
+                if payload == "[DONE]":
+                    return
+                try:
+                    chunk_data = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
 
-                    content = delta.get("content")
-                    if content:
-                        yield StreamChunk(kind="text_delta", content=content)
+                choices = chunk_data.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                finish_reason = choice.get("finish_reason")
 
-                    for tc in delta.get("tool_calls") or []:
-                        fn = tc.get("function") or {}
-                        yield StreamChunk(
-                            kind="tool_call_delta",
-                            tool_index=tc.get("index"),
-                            tool_id=tc.get("id"),
-                            tool_name=fn.get("name"),
-                            arguments_fragment=fn.get("arguments"),
-                        )
+                content = delta.get("content")
+                if content:
+                    yield StreamChunk(kind="text_delta", content=content)
 
-                    if finish_reason is not None:
-                        yield StreamChunk(
-                            kind="done",
-                            finish_reason=finish_reason,
-                            usage=chunk_data.get("usage"),
-                        )
+                for tc in delta.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    yield StreamChunk(
+                        kind="tool_call_delta",
+                        tool_index=tc.get("index"),
+                        tool_id=tc.get("id"),
+                        tool_name=fn.get("name"),
+                        arguments_fragment=fn.get("arguments"),
+                    )
+
+                if finish_reason is not None:
+                    yield StreamChunk(
+                        kind="done",
+                        finish_reason=finish_reason,
+                        usage=chunk_data.get("usage"),
+                    )
 
     async def list_models(self, force_refresh: bool = False) -> list[dict[str, Any]]:
         """Fetch available models from the OpenRouter models endpoint.

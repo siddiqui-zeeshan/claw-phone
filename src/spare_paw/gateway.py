@@ -130,7 +130,14 @@ def _sd_notify(message: str) -> None:
 
 
 async def _heartbeat() -> None:
-    """Touch the heartbeat file and ping systemd watchdog every 30 seconds."""
+    """Touch the heartbeat file and ping systemd watchdog every 30 seconds.
+
+    The watchdog ping is gated on the message-queue consumer being alive:
+    liveness must reflect the component that actually serves the user, not
+    just the event loop.
+    """
+    from spare_paw.core import engine as engine_mod
+
     while True:
         try:
             HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +146,12 @@ async def _heartbeat() -> None:
             )
         except OSError:
             logger.exception("Failed to write heartbeat file")
-        _sd_notify("WATCHDOG=1")
+        if engine_mod.queue_healthy():
+            _sd_notify("WATCHDOG=1")
+        else:
+            logger.error(
+                "Queue processor is dead — withholding systemd watchdog ping"
+            )
         await asyncio.sleep(30)
 
 
@@ -156,7 +168,10 @@ async def init_app_state() -> AppState:
     await init_db()
 
     executor = ProcessPoolExecutor(max_workers=4)
-    semaphore = asyncio.Semaphore(1)
+    # Bounded LLM concurrency. 1 would serialize the main agent, every
+    # subagent, and consult answers behind each other — consults would time
+    # out structurally and "parallel" agents would run sequentially.
+    semaphore = asyncio.Semaphore(int(config.get("llm.max_concurrent", 4)))
 
     from spare_paw.router.openrouter import OpenRouterClient
 
@@ -427,8 +442,13 @@ async def _async_main() -> None:
         logger.info("Webhook API listening on port %d", config.get("webhook.port", 8080))
 
     # 16. Start message queue processor (must be after initialize/start)
+    from spare_paw.core.engine import recover_orphans as _recover_orphans
     from spare_paw.core.engine import start_queue_processor as _start_queue
     _start_queue(app_state, backend)
+
+    # 17. Reconcile state from before the last shutdown/crash: mark orphaned
+    # agents interrupted and re-enqueue undelivered agent callbacks.
+    await _recover_orphans(app_state, backend)
 
     logger.info("Bot started (%s backend)", backend_type)
     _sd_notify("READY=1")
@@ -437,8 +457,32 @@ async def _async_main() -> None:
     await shutdown_event.wait()
 
     # ---- Graceful shutdown ----
+    # Ordering matters: stop producing work (cron), cancel agents (their
+    # finally blocks persist state), drain the queue, and only then tear
+    # down the resources those tasks depend on (clients, DB).
     logger.info("Shutting down...")
     _sd_notify("STOPPING=1")
+
+    # Stop cron scheduler — no new work
+    if app_state.scheduler is not None:
+        try:
+            await app_state.scheduler.stop()
+        except Exception:
+            logger.exception("Error shutting down scheduler")
+
+    # Cancel running subagents; they record status "interrupted" for recovery
+    from spare_paw.tools import subagent as _subagent_mod
+    try:
+        await _subagent_mod.shutdown()
+    except Exception:
+        logger.exception("Error shutting down subagents")
+
+    # Drain outstanding queue items (bounded), then stop the consumer
+    from spare_paw.core.engine import stop_queue_processor as _stop_queue
+    try:
+        await _stop_queue()
+    except Exception:
+        logger.exception("Error stopping queue processor")
 
     heartbeat_task.cancel()
     try:
@@ -449,13 +493,6 @@ async def _async_main() -> None:
     # Close browser session
     from spare_paw.tools import browser as _browser_mod
     await _browser_mod.shutdown()
-
-    # Stop cron scheduler
-    if app_state.scheduler is not None:
-        try:
-            await app_state.scheduler.stop()
-        except Exception:
-            logger.exception("Error shutting down scheduler")
 
     # Close MCP client
     if app_state.mcp_client is not None:

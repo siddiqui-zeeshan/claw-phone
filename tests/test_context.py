@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 import pytest_asyncio
 import aiosqlite
@@ -151,6 +153,32 @@ async def test_assemble_caps_summary_tokens(_init_db, monkeypatch):
     assert "Summary 9" in last_summary, "Newest summary should be included"
 
     config_mod.config.set_override("context.summary_token_budget", 5000)
+
+
+@pytest.mark.asyncio
+async def test_assemble_skips_corrupt_metadata(_init_db):
+    """A message row with corrupt JSON in the metadata column must not crash assemble()."""
+    conn = _init_db
+    conv_id = await new_conversation()
+    await ingest(conv_id, "user", "Hello")
+
+    # Insert a message with garbage in the metadata column directly
+    await conn.execute(
+        """INSERT INTO messages (id, conversation_id, role, content, token_count, created_at, metadata)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("corrupt-meta-msg", conv_id, "assistant", "I did something", 5,
+         datetime.now(timezone.utc).isoformat(), "{not valid json"),
+    )
+    await conn.commit()
+
+    messages = await assemble(conv_id, "sys")
+
+    # The corrupt row is still included — only its metadata is skipped
+    contents = [m["content"] for m in messages]
+    assert "I did something" in contents
+    corrupt = next(m for m in messages if m["content"] == "I did something")
+    assert "tool_call_id" not in corrupt
+    assert "tool_calls" not in corrupt
 
 
 # ---------------------------------------------------------------------------

@@ -18,12 +18,17 @@ import spare_paw.tools.subagent as subagent_mod
 
 @pytest.fixture(autouse=True)
 def _reset_agents():
-    """Clear the global _agents and _channels dicts before each test."""
-    subagent_mod._agents.clear()
-    subagent_mod._channels.clear()
+    """Clear the global _agents/_channels dicts and notification claims before each test."""
+    def _clear() -> None:
+        subagent_mod._agents.clear()
+        subagent_mod._channels.clear()
+        getattr(subagent_mod, "_notified_groups", set()).clear()
+        if hasattr(subagent_mod, "_shutting_down"):
+            subagent_mod._shutting_down = False
+
+    _clear()
     yield
-    subagent_mod._agents.clear()
-    subagent_mod._channels.clear()
+    _clear()
 
 
 def _make_app_state() -> MagicMock:
@@ -851,12 +856,14 @@ async def test_tool_loop_to_spawn_handler_integration():
         }]
     }
 
-    mock_client = MagicMock()
-    mock_client.chat = AsyncMock(return_value=batch_response)
+    from tests._stream_helpers import FakeStreamingClient, response_dict_to_chunks
+
+    # spawn_agent returns __stop_turn__, so the loop ends after this batch.
+    client = FakeStreamingClient([response_dict_to_chunks(batch_response)])
 
     with patch.object(subagent_mod, "_run_agent", side_effect=_noop_run_agent):
         await run_tool_loop(
-            client=mock_client,
+            client=client,
             messages=[{"role": "user", "content": "do two things"}],
             model="m",
             tools=registry.get_schemas(),
@@ -1546,3 +1553,258 @@ async def test_notify_formats_structured_results():
     assert "What is the budget?" in synthetic
 
     subagent_mod._message_queue = None
+
+
+# ---------------------------------------------------------------------------
+# Robustness audit fixes
+# ---------------------------------------------------------------------------
+
+import pytest_asyncio  # noqa: E402
+
+from spare_paw.router.tool_loop import ToolLoopResult  # noqa: E402
+
+
+def _completed_agent(name: str, group_id: str) -> dict:
+    return {
+        "name": name,
+        "status": "completed",
+        "group_id": group_id,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "result": "raw",
+        "parsed_result": {
+            "status": "complete",
+            "summary": f"{name} done",
+            "findings": [],
+            "sources": [],
+        },
+    }
+
+
+class TestSingleFlightGroupNotification:
+    @pytest.mark.asyncio
+    async def test_concurrent_group_completion_notifies_once(self):
+        """Two agents finishing simultaneously must produce exactly one callback."""
+        queue: asyncio.Queue = asyncio.Queue()
+        subagent_mod._message_queue = queue
+        subagent_mod._agents["g1a"] = _completed_agent("g1a", "grp-race")
+        subagent_mod._agents["g1b"] = _completed_agent("g1b", "grp-race")
+
+        await asyncio.gather(
+            subagent_mod._maybe_notify_group("grp-race"),
+            subagent_mod._maybe_notify_group("grp-race"),
+        )
+
+        assert queue.qsize() == 1
+        subagent_mod._message_queue = None
+
+    @pytest.mark.asyncio
+    async def test_incomplete_group_is_not_notified(self):
+        queue: asyncio.Queue = asyncio.Queue()
+        subagent_mod._message_queue = queue
+        subagent_mod._agents["g2a"] = _completed_agent("g2a", "grp-partial")
+        running = _completed_agent("g2b", "grp-partial")
+        running["status"] = "running"
+        subagent_mod._agents["g2b"] = running
+
+        await subagent_mod._maybe_notify_group("grp-partial")
+
+        assert queue.qsize() == 0
+        subagent_mod._message_queue = None
+
+
+class TestOutcomeMapping:
+    @pytest.mark.asyncio
+    async def test_llm_timeout_outcome_marks_agent_failed(self):
+        """A loop-level failure must NOT be reported as a completed agent."""
+        app_state = _make_app_state()
+        agent_id = "fail-map"
+        subagent_mod._agents[agent_id] = {
+            "name": "mapper",
+            "prompt": "test",
+            "status": "starting",
+            "group_id": None,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+
+        fake = ToolLoopResult(
+            text="LLM call timed out after 120s. Try again.",
+            outcome="llm_timeout",
+            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        )
+
+        with patch("spare_paw.router.tool_loop.run_tool_loop", return_value=fake):
+            with patch("spare_paw.core.prompt.build_subagent_prompt", return_value="sys"):
+                await subagent_mod._run_agent(
+                    agent_id, "test", app_state,
+                    model=None, tools_filter=None, max_iterations=5,
+                )
+
+        agent = subagent_mod._agents[agent_id]
+        assert agent["status"] == "failed"
+        assert "llm_timeout" in agent["error"]
+
+
+class TestSpawnHardening:
+    @pytest.mark.asyncio
+    async def test_spawn_clamps_max_iterations(self):
+        app_state = _make_app_state()
+        captured: dict = {}
+
+        async def fake_run_agent(agent_id, prompt, app_state, model, tools_filter,
+                                 max_iterations, system_suffix=None, tool_limits=None):
+            captured["max_iterations"] = max_iterations
+
+        with patch.object(subagent_mod, "_run_agent", side_effect=fake_run_agent):
+            await subagent_mod._handle_spawn(app_state, name="x", prompt="y", max_iterations=5000)
+            await asyncio.sleep(0)
+
+        assert captured["max_iterations"] <= 30
+
+    @pytest.mark.asyncio
+    async def test_spawn_survives_progress_send_failure(self):
+        """A failed Telegram progress message must not fail the spawn (duplicate-agent risk)."""
+        app_state = _make_app_state()
+
+        class _Backend:
+            async def send_progress(self, text):
+                raise RuntimeError("telegram down")
+
+        app_state.backend = _Backend()
+
+        with patch.object(subagent_mod, "_run_agent", side_effect=_noop_run_agent):
+            result = json.loads(
+                await subagent_mod._handle_spawn(app_state, name="x", prompt="y")
+            )
+
+        assert "agent_id" in result
+        assert result["__stop_turn__"] is True
+
+
+class TestArchetypeLeastPrivilege:
+    def test_researcher_has_no_shell_or_files(self):
+        """Web-facing agents must not combine untrusted content with shell access."""
+        tools = subagent_mod.AGENT_TYPES["researcher"]["tools"]
+        assert "shell" not in tools
+        assert "files" not in tools
+
+    def test_browser_has_no_shell_or_files(self):
+        tools = subagent_mod.AGENT_TYPES["browser"]["tools"]
+        assert "shell" not in tools
+        assert "files" not in tools
+
+
+@pytest_asyncio.fixture
+async def _tmp_agents_db(tmp_path):
+    """Isolated DB with the agents/agent_callbacks schema applied."""
+    import spare_paw.db as db_mod
+
+    tmp_db_dir = tmp_path / ".spare-paw"
+    tmp_db_dir.mkdir()
+    with patch.object(db_mod, "DB_DIR", tmp_db_dir), \
+         patch.object(db_mod, "DB_PATH", tmp_db_dir / "spare-paw.db"):
+        db_mod._connection = None
+        await db_mod.init_db()
+        yield db_mod
+        await db_mod.close_db()
+
+
+class TestAgentPersistence:
+    @pytest.mark.asyncio
+    async def test_spawn_persists_agent_row(self, _tmp_agents_db):
+        app_state = _make_app_state()
+
+        with patch.object(subagent_mod, "_run_agent", side_effect=_noop_run_agent):
+            result = json.loads(
+                await subagent_mod._handle_spawn(app_state, name="persisted", prompt="task")
+            )
+
+        db = await _tmp_agents_db.get_db()
+        async with db.execute(
+            "SELECT name, status FROM agents WHERE id = ?", (result["agent_id"],)
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row is not None
+        assert row["name"] == "persisted"
+
+    @pytest.mark.asyncio
+    async def test_completion_updates_persisted_status(self, _tmp_agents_db):
+        app_state = _make_app_state()
+        agent_id = "persist-done"
+        subagent_mod._agents[agent_id] = {
+            "name": "finisher",
+            "prompt": "test",
+            "status": "starting",
+            "group_id": None,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+
+        fake = ToolLoopResult(
+            text=json.dumps({"status": "complete", "summary": "ok",
+                             "findings": [], "sources": []}),
+            outcome="ok",
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        )
+
+        with patch("spare_paw.router.tool_loop.run_tool_loop", return_value=fake):
+            with patch("spare_paw.core.prompt.build_subagent_prompt", return_value="sys"):
+                await subagent_mod._run_agent(
+                    agent_id, "test", app_state,
+                    model=None, tools_filter=None, max_iterations=5,
+                )
+
+        db = await _tmp_agents_db.get_db()
+        async with db.execute(
+            "SELECT status FROM agents WHERE id = ?", (agent_id,)
+        ) as cur:
+            row = await cur.fetchone()
+
+        assert row is not None
+        assert row["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_callback_persisted_before_enqueue(self, _tmp_agents_db):
+        queue: asyncio.Queue = asyncio.Queue()
+        subagent_mod._message_queue = queue
+        subagent_mod._agents["cb1"] = _completed_agent("cb1", "grp-cb")
+
+        await subagent_mod._notify_main_agent("grp-cb")
+
+        db = await _tmp_agents_db.get_db()
+        async with db.execute(
+            "SELECT id, delivered, payload FROM agent_callbacks"
+        ) as cur:
+            rows = await cur.fetchall()
+
+        assert len(rows) == 1
+        assert rows[0]["delivered"] == 0
+        assert "cb1 done" in rows[0]["payload"]
+
+        item = queue.get_nowait()
+        assert item[0] == "agent_callback"
+        assert item[2] == rows[0]["id"]
+        subagent_mod._message_queue = None
+
+
+class TestSubagentBudgetWiring:
+    @pytest.mark.asyncio
+    async def test_run_agent_passes_token_budget(self):
+        app_state = _make_app_state()
+        agent_id = "budget-1"
+        subagent_mod._agents[agent_id] = {
+            "name": "budgeted",
+            "prompt": "test",
+            "status": "starting",
+            "group_id": None,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+
+        fake = ToolLoopResult(text="{}", outcome="ok", usage={})
+        with patch("spare_paw.router.tool_loop.run_tool_loop", return_value=fake) as mock_loop:
+            with patch("spare_paw.core.prompt.build_subagent_prompt", return_value="sys"):
+                await subagent_mod._run_agent(
+                    agent_id, "test", app_state,
+                    model=None, tools_filter=None, max_iterations=5,
+                )
+
+        assert mock_loop.await_args.kwargs.get("token_budget", 0) > 0

@@ -59,8 +59,18 @@ tools:
   cron:
     enabled: true
 
+# Cron scheduling
+# cron:
+#   timezone: "Asia/Kolkata"  # explicit timezone for cron schedules; defaults to system local
+
+llm:
+  max_concurrent: 4  # parallel LLM calls (main agent + subagents + consults)
+
 agent:
   max_tool_iterations: 20
+  subagent_max_iterations_cap: 30  # hard server-side iteration cap for spawned subagents
+  subagent_token_budget: 150000    # per-subagent token budget; the agent is stopped when exhausted
+  message_timeout_seconds: 600     # wall-clock ceiling for processing one message end-to-end
   # The system_prompt uses {current_time} as a placeholder filled at runtime.
   # "Device:" is auto-detected if omitted.
   system_prompt: |

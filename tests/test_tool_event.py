@@ -7,34 +7,30 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from spare_paw.router.openrouter import StreamChunk
 from spare_paw.router.tool_loop import DEFAULT_TOOL_LIMITS, ToolEvent, run_tool_loop
+from tests._stream_helpers import FakeStreamingClient, response_to_chunks
 
 
-def _text_response(content: str = "done") -> dict:
-    return {
-        "choices": [{"message": {"role": "assistant", "content": content}}],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-    }
+def _text_chunks(content: str = "done") -> list[StreamChunk]:
+    return response_to_chunks(
+        content=content,
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
 
 
-def _tool_call_response(name: str, arguments: dict, call_id: str = "call_1") -> dict:
-    return {
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(arguments),
-                    },
-                }],
-            }
+def _tool_call_chunks(name: str, arguments: dict, call_id: str = "call_1") -> list[StreamChunk]:
+    return response_to_chunks(
+        tool_calls=[{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(arguments),
+            },
         }],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-    }
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
 
 
 class TestToolEvent:
@@ -59,11 +55,10 @@ class TestOnEventCallback:
         events: list[ToolEvent] = []
         on_event = MagicMock(side_effect=lambda e: events.append(e))
 
-        mock_client = AsyncMock()
-        mock_client.chat = AsyncMock(return_value=_text_response("hi"))
+        client = FakeStreamingClient([_text_chunks("hi")])
 
         await run_tool_loop(
-            client=mock_client,
+            client=client,
             messages=[{"role": "user", "content": "hello"}],
             model="m",
             tools=[],
@@ -81,16 +76,15 @@ class TestOnEventCallback:
         events: list[ToolEvent] = []
         on_event = MagicMock(side_effect=lambda e: events.append(e))
 
-        mock_client = AsyncMock()
-        mock_client.chat = AsyncMock(side_effect=[
-            _tool_call_response("shell", {"command": "ls"}),
-            _text_response("done"),
+        client = FakeStreamingClient([
+            _tool_call_chunks("shell", {"command": "ls"}),
+            _text_chunks("done"),
         ])
         mock_registry = AsyncMock()
         mock_registry.execute = AsyncMock(return_value="file_list")
 
         await run_tool_loop(
-            client=mock_client,
+            client=client,
             messages=[{"role": "user", "content": "list"}],
             model="m",
             tools=[{"type": "function", "function": {"name": "shell"}}],
@@ -108,11 +102,10 @@ class TestOnEventCallback:
     @pytest.mark.asyncio
     async def test_no_event_callback_is_safe(self):
         """on_event=None should not cause errors."""
-        mock_client = AsyncMock()
-        mock_client.chat = AsyncMock(return_value=_text_response("hi"))
+        client = FakeStreamingClient([_text_chunks("hi")])
 
         result = await run_tool_loop(
-            client=mock_client,
+            client=client,
             messages=[],
             model="m",
             tools=[],
@@ -124,16 +117,23 @@ class TestOnEventCallback:
 
 class TestOnTokenCallback:
     @pytest.mark.asyncio
-    async def test_fires_tokens_for_final_text(self):
-        """on_token receives word-chunked tokens of the final response."""
+    async def test_fires_tokens_for_streamed_deltas(self):
+        """on_token receives each text delta of the final response as streamed."""
         tokens: list[str] = []
         on_token = MagicMock(side_effect=lambda t: tokens.append(t))
 
-        mock_client = AsyncMock()
-        mock_client.chat = AsyncMock(return_value=_text_response("hello world"))
+        client = FakeStreamingClient([[
+            StreamChunk(kind="text_delta", content="hello "),
+            StreamChunk(kind="text_delta", content="world"),
+            StreamChunk(
+                kind="done",
+                finish_reason="stop",
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            ),
+        ]])
 
         result = await run_tool_loop(
-            client=mock_client,
+            client=client,
             messages=[],
             model="m",
             tools=[],
@@ -142,16 +142,15 @@ class TestOnTokenCallback:
         )
 
         assert result == "hello world"
-        assert tokens == ["hello ", "world "]
+        assert tokens == ["hello ", "world"]
 
     @pytest.mark.asyncio
     async def test_no_token_callback_is_safe(self):
         """on_token=None should not cause errors."""
-        mock_client = AsyncMock()
-        mock_client.chat = AsyncMock(return_value=_text_response("hi"))
+        client = FakeStreamingClient([_text_chunks("hi")])
 
         result = await run_tool_loop(
-            client=mock_client,
+            client=client,
             messages=[],
             model="m",
             tools=[],

@@ -213,3 +213,56 @@ class TestFilesTool:
         res = json.loads(await execute_files("write", fpath, content=None, allowed_paths=allowed))
         assert "error" in res
         assert "content" in res["error"].lower()
+
+
+# ===========================================================================
+# Custom tools — execution environment and logging
+# ===========================================================================
+
+
+class TestCustomToolExecution:
+    @staticmethod
+    def _write_script(tmp_path, content: str):
+        script = tmp_path / "tool.sh"
+        script.write_text(content, encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    def test_env_does_not_leak_parent_secrets(self, tmp_path, monkeypatch):
+        from spare_paw.tools.custom_tools import _execute_custom_tool
+
+        monkeypatch.setenv("SPARE_PAW_FAKE_SECRET", "sk-supersecretvalue12345")
+        script = self._write_script(tmp_path, "env\n")
+
+        result = json.loads(_execute_custom_tool(str(script)))
+
+        assert result["exit_code"] == 0
+        assert "SPARE_PAW_FAKE_SECRET" not in result["stdout"]
+        assert "sk-supersecretvalue12345" not in result["stdout"]
+        # Allowlisted basics must still be present
+        assert "PATH=" in result["stdout"]
+
+    def test_env_still_passes_tool_params(self, tmp_path):
+        from spare_paw.tools.custom_tools import _execute_custom_tool
+
+        script = self._write_script(tmp_path, 'echo "city=$TOOL_CITY"\n')
+        result = json.loads(_execute_custom_tool(str(script), city="Berlin"))
+
+        assert result["exit_code"] == 0
+        assert "city=Berlin" in result["stdout"]
+
+    def test_param_logging_redacts_secrets(self, tmp_path, caplog):
+        import logging
+
+        from spare_paw.tools.custom_tools import _execute_custom_tool
+
+        secret = "sk-" + "a" * 24
+        script = self._write_script(tmp_path, "true\n")
+
+        with caplog.at_level(logging.INFO, logger="spare_paw.tools.custom_tools"):
+            _execute_custom_tool(str(script), api_key=secret, city="Berlin")
+
+        assert secret not in caplog.text
+        assert "[REDACTED]" in caplog.text
+        # Non-secret params remain visible for debuggability
+        assert "city" in caplog.text
